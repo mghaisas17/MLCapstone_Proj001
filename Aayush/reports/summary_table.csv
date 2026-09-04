@@ -1,0 +1,2 @@
+horizon,model,synthetic_auroc_max,synthetic_auroc_at_smallest_magnitude,events_detected,events_total,false_positive_rate,regime_transition_hit_rate
+macro,expected_signature_distance,0.924,0.4883,3,5,0.04714640198511166,0.10526315789473684
