@@ -1,0 +1,19 @@
+numpy
+pandas
+scipy
+scikit-learn
+requests
+yfinance
+matplotlib
+pyyaml
+ipykernel
+nbformat
+jupyter
+
+# Optional, faster C++ signature backend. Requires a working C++ toolchain
+# (this machine's Command Line Tools are missing standard headers as of
+# project setup -- `xcode-select --install` / reinstalling CLT should fix
+# it). src/features/signatures.py works fully without it via a pure-NumPy
+# implementation; iisignature is only used as an optional speed-up if present.
+# iisignature
+pyarrow

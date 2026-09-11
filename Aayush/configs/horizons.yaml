@@ -1,0 +1,65 @@
+# Horizon definitions for multi-scale path-signature novelty detection.
+# window: number of bars per rolling window at that horizon's native resolution.
+# step: stride between consecutive windows (overlap = window - step).
+# depth: truncated signature depth used for this horizon's channel set.
+
+asset: BTCUSDT
+yahoo_ticker: BTC-USD
+
+horizons:
+  micro:
+    description: "Tick-level microstructure, ~minutes"
+    source: binance_ticks
+    window: 1000        # trades per window
+    step: 500
+    depth: 3
+    channels: [time, log_price, signed_volume]
+
+  intraday:
+    description: "Hourly bars, ~1 day - 1 week"
+    source: binance_klines_1m   # resampled to 1h
+    resample: 1h
+    window: 48           # hours per window (~2 days)
+    step: 24
+    depth: 4
+    channels: [time, log_return, volume]
+
+  macro:
+    description: "Daily bars, ~1-3 months"
+    source: yahoo_daily
+    window: 30           # trading days per window
+    step: 10
+    depth: 4
+    channels: [time, log_return, volume]
+
+reference_period:
+  # Calm BTC stretch used to fit "normal" reference statistics (scalers,
+  # expected signature, baseline model training). Chosen as a relatively
+  # low-volatility stretch well clear of all labeled events below.
+  start: "2023-10-01"
+  end: "2023-12-15"
+
+# Raw trade-by-trade data for the micro horizon is enormous (~800k-900k
+# trades/day for BTCUSDT), so it uses its own much shorter reference window
+# rather than the full multi-month reference_period above -- a few days is
+# already tens of millions of ticks once split into 1000-trade windows.
+tick_reference_period:
+  start: "2023-10-01"
+  end: "2023-10-05"
+
+events:
+  covid_crash:
+    start: "2020-02-20"
+    end: "2020-04-30"
+  meme_stock_era_btc_runup_crash:
+    start: "2021-01-01"
+    end: "2021-05-31"
+  crypto_crash_terra_luna:
+    start: "2022-05-01"
+    end: "2022-05-31"
+  crypto_crash_ftx:
+    start: "2022-11-01"
+    end: "2022-11-30"
+  banking_crisis_2023:
+    start: "2023-03-01"
+    end: "2023-03-31"
