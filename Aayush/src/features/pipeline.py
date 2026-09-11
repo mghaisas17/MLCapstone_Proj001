@@ -63,6 +63,46 @@ def build_signature_features(
     return np.vstack(feats)
 
 
+def raw_paths_by_reference_period(
+    df: pd.DataFrame, cfg: HorizonConfig, periods: list[dict]
+) -> list[list[np.ndarray]]:
+    """Like `raw_paths_for_horizon`, but run once per disjoint reference
+    period and kept separate (a list of per-period raw-path lists) rather
+    than flattened -- so a caller can split train/calibration *within* each
+    period (e.g. first ~40% of each period's own windows for training) rather
+    than cutting the pooled list once, which would let whichever period
+    happens to sort first/last dominate one side of the split. Windows are
+    never built across a period boundary: each period's slice is windowed
+    independently, so two disconnected calm stretches can never be spliced
+    into one fake window."""
+    return [raw_paths_for_horizon(df.loc[p["start"]:p["end"]], cfg)[1] for p in periods]
+
+
+def raw_paths_for_reference_periods(
+    df: pd.DataFrame, cfg: HorizonConfig, periods: list[dict]
+) -> list[np.ndarray]:
+    """Flattened convenience wrapper around `raw_paths_by_reference_period`,
+    for callers that just want one pooled list of reference raw paths (e.g.
+    to fit a single model or a single normalization scale across every
+    period)."""
+    per_period = raw_paths_by_reference_period(df, cfg, periods)
+    return [path for period_paths in per_period for path in period_paths]
+
+
+def fit_reference_scale_multi(df: pd.DataFrame, cfg: HorizonConfig, periods: list[dict]) -> np.ndarray:
+    """Multi-period analogue of `fit_reference_scale`: pools increment
+    statistics across every reference period (different market eras) before
+    fitting the per-channel increment-scale normalization, rather than fitting
+    from one contiguous stretch."""
+    raw_paths = raw_paths_for_reference_periods(df, cfg, periods)
+    if not raw_paths:
+        raise RuntimeError(
+            f"No {cfg.name!r} windows could be built from the given reference periods "
+            f"(need >= {cfg.window} rows in at least one period)."
+        )
+    return fit_normalization_scale(raw_paths)
+
+
 def fit_reference_scale(df: pd.DataFrame, cfg: HorizonConfig) -> np.ndarray:
     """Fit the increment-scale normalization from a reference ("normal")
     period slice of `df` (already trimmed to that period by the caller)."""

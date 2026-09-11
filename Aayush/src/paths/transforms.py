@@ -43,6 +43,29 @@ def extract_channels(window_data: pd.DataFrame, channels: list[str], source: str
             cols["log_return"] = np.cumsum(log_ret)
         if "volume" in channels:
             cols["volume"] = window_data["volume"].to_numpy(dtype=float)
+        if "log_range" in channels:
+            # Intraday/interday dispersion (Parkinson-style realized-range
+            # proxy) that close-to-close log_return misses entirely -- a bar
+            # that spikes and reverts looks identical to a flat bar in
+            # log_return alone. Raw per-bar value, not cumulative, matching
+            # how `volume` above is already treated (not every channel needs
+            # the cumulative-from-start zeroing that price-level channels
+            # need -- only channels representing an unbounded level do).
+            high = window_data["high"].to_numpy(dtype=float)
+            low = window_data["low"].to_numpy(dtype=float)
+            cols["log_range"] = np.log(high) - np.log(low)
+        if "overnight_gap" in channels:
+            # log(open / previous bar's close): jump/gap risk between bars,
+            # distinct from the log_return channel's own close-to-close move.
+            # The first bar in a window has no preceding close *within the
+            # window*, so its gap is set to 0 -- "no prior information
+            # available yet" -- mirroring log_return's own `prepend=log(close[0])`
+            # convention for the same edge case.
+            opens = window_data["open"].to_numpy(dtype=float)
+            prev_close = np.concatenate(([close[0]], close[:-1]))
+            gap = np.log(opens) - np.log(prev_close)
+            gap[0] = 0.0
+            cols["overnight_gap"] = gap
 
     missing = [c for c in channels if c not in cols]
     if missing:
@@ -83,6 +106,30 @@ def lead_lag(series: np.ndarray) -> np.ndarray:
     lag = np.repeat(series, 2)[:-1]
     lead = np.repeat(series, 2)[1:]
     return np.column_stack([lag, lead])
+
+
+def apply_recency_weights(path: np.ndarray, halflife: float) -> np.ndarray:
+    """Reweight a path's increments by recency (exponential decay, given
+    `halflife` in steps) before the signature is computed: the increment
+    closest to the window's end counts at ~full weight, and increments
+    further back count for exponentially less. Rebuilt by cumulative-summing
+    the reweighted increments back onto the path's own starting level, so
+    everything downstream (`add_basepoint`, `signature`) is unaffected -- it
+    just receives a differently-shaped path.
+
+    Apply this *after* `normalize` (so the increment-scale fit, which assumes
+    unweighted increments, isn't itself biased toward the window's tail) and
+    *before* `add_basepoint`. Apply identically to both live-scored windows
+    and reference/calibration paths used to fit a model -- weighting only one
+    side would bias every distance/score computed between them."""
+    L = path.shape[0]
+    if L < 2:
+        return path
+    increments = np.diff(path, axis=0)
+    steps_from_end = (L - 2) - np.arange(L - 1)  # 0 = most recent increment, larger = older
+    weights = np.exp(-np.log(2) / halflife * steps_from_end)
+    weighted_increments = increments * weights[:, None]
+    return np.vstack([path[:1], path[:1] + np.cumsum(weighted_increments, axis=0)])
 
 
 def normalize(path: np.ndarray, scale: np.ndarray) -> np.ndarray:

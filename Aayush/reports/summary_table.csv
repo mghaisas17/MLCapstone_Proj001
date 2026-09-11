@@ -1,2 +1,14 @@
 horizon,model,synthetic_auroc_max,synthetic_auroc_at_smallest_magnitude,events_detected,events_total,false_positive_rate,regime_transition_hit_rate
-macro,expected_signature_distance,0.924,0.4883,3,5,0.04714640198511166,0.10526315789473684
+macro,expected_signature_distance,0.9788,0.509,4,5,0.21588089330024815,0.2894736842105263
+macro,conformance_score,0.9764,0.5056,4,5,0.20595533498759305,0.2894736842105263
+macro,cvar_ocsvm,0.489,0.489,0,5,0.02977667493796526,0.02631578947368421
+macro_daily,expected_signature_distance_recency_weighted,0.9972,0.4849,4,5,0.06035767511177347,0.3815789473684211
+macro_engineered,sklearn_one_class_svm,,,5,5,0.34491315136476425,0.5921052631578947
+macro_engineered,sklearn_isolation_forest,,,2,5,0.07692307692307693,0.15789473684210525
+macro_engineered,sklearn_local_outlier_factor,,,2,5,0.1588089330024814,0.17105263157894737
+macro_engineered,sklearn_elliptic_envelope,,,1,5,0.03225806451612903,0.09210526315789473
+macro_engineered,pyod_ecod,,,1,5,0.017369727047146403,0.11842105263157894
+macro,matrix_profile_stumpy,,,1,5,0.011428571428571429,0.2236842105263158
+macro,gaussian_hmm,,,5,5,0.5617755856966707,1.0
+macro,signature_mmd,0.9788,0.509,4,5,0.3176178660049628,0.4473684210526316
+macro_ensemble,hmm_confirmed_by_esd,,,4,5,0.23329223181257708,0.6052631578947368

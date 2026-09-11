@@ -30,14 +30,48 @@ horizons:
     window: 30           # trading days per window
     step: 10
     depth: 4
-    channels: [time, log_return, volume]
+    channels: [time, log_return, volume, log_range, overnight_gap]
 
-reference_period:
-  # Calm BTC stretch used to fit "normal" reference statistics (scalers,
-  # expected signature, baseline model training). Chosen as a relatively
-  # low-volatility stretch well clear of all labeled events below.
-  start: "2023-10-01"
-  end: "2023-12-15"
+  macro_daily:
+    # Identical to `macro` except step=1: a fresh score every day instead of
+    # every 10 days. Used only for the *live/scored* series -- calibration
+    # (fitting "normal", the Weibull tail, BH-FDR) stays on `macro`'s coarser,
+    # much-less-overlapping step so those statistics aren't corrupted by
+    # near-total window overlap (adjacent step=1 windows share 29 of 30 days).
+    description: "Daily bars, scored every day (recency-weighted)"
+    source: yahoo_daily
+    window: 30
+    step: 1
+    depth: 4
+    channels: [time, log_return, volume, log_range, overnight_gap]
+
+# Half-life (in days) for apply_recency_weights: how quickly an increment's
+# influence on a window's signature decays as it ages within the window.
+# Tunable; 7-10 days was the agreed range, 8 is the midpoint default.
+recency_halflife_days: 8
+
+# Calm BTC stretches used to fit "normal" reference statistics (scalers,
+# expected signature, baseline model training). Auto-detected via
+# src.evaluation.regimes.find_calm_stretches (low_vol runs >= 45 days,
+# >= 30 days clear of every labeled event below) rather than hand-picked --
+# spans multiple market eras (2015-2026) instead of one 2023 stretch, which
+# the project's own evaluation showed left every model calibrated on as few
+# as 2-7 windows from a single quarter. Re-generate by re-running
+# find_calm_stretches if its parameters change.
+reference_periods:
+  - {start: "2015-04-07", end: "2015-08-17"}
+  - {start: "2015-09-07", end: "2015-11-02"}
+  - {start: "2016-02-09", end: "2016-06-11"}
+  - {start: "2016-07-16", end: "2017-01-04"}
+  - {start: "2017-01-31", end: "2017-03-16"}
+  - {start: "2018-08-13", end: "2018-11-18"}
+  - {start: "2019-01-17", end: "2019-04-01"}
+  - {start: "2020-06-04", end: "2020-11-25"}
+  - {start: "2024-04-09", end: "2024-08-07"}
+  - {start: "2024-08-28", end: "2024-11-10"}
+  - {start: "2024-11-30", end: "2025-03-02"}
+  - {start: "2025-04-26", end: "2026-02-04"}
+  - {start: "2026-02-26", end: "2026-09-03"}
 
 # Raw trade-by-trade data for the micro horizon is enormous (~800k-900k
 # trades/day for BTCUSDT), so it uses its own much shorter reference window
@@ -46,6 +80,15 @@ reference_period:
 tick_reference_period:
   start: "2023-10-01"
   end: "2023-10-05"
+
+# Binance (source for intraday/micro) only launched in 2017, so most of the
+# multi-era `reference_periods` above -- sourced from Yahoo, which goes back
+# to 2014 -- aren't available for these two horizons. Intraday isn't
+# multi-period-calibrated yet (it hasn't been event-validated at all so far);
+# this keeps its original single reference stretch until that's tackled.
+intraday_reference_period:
+  start: "2023-10-01"
+  end: "2023-12-15"
 
 events:
   covid_crash:

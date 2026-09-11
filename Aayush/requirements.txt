@@ -17,3 +17,16 @@ jupyter
 # implementation; iisignature is only used as an optional speed-up if present.
 # iisignature
 pyarrow
+
+# Breadth of additional anomaly-detection measures/methods (see project plan):
+pyod        # ~10+ outlier-detection algorithms in one package, incl. ECOD (distribution-free, robust to heavy tails)
+stumpy      # matrix profile / discord detection, per-day-native
+ruptures    # changepoint detection
+
+# hmmlearn requires compiling a pybind11 C++ extension, which fails on this
+# machine for the same reason iisignature does above (broken Xcode Command
+# Line Tools, missing standard headers -- `cstddef` not found). Rather than
+# block on that, the Gaussian-HMM baseline is hand-rolled in pure NumPy in
+# src/models/gaussian_hmm.py (Baum-Welch EM + forward-backward), the same
+# workaround already used for the signature computation itself.
+# hmmlearn

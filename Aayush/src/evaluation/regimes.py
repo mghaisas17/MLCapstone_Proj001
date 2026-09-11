@@ -30,6 +30,51 @@ def regime_transition_dates(labels: pd.Series) -> pd.DatetimeIndex:
     return labels.index[changed.fillna(False)]
 
 
+def find_calm_stretches(
+    daily_close: pd.Series,
+    events: dict[str, dict[str, str]],
+    min_length_days: int = 45,
+    vol_window: int = 20,
+    quantile: float = 0.66,
+    event_buffer_days: int = 30,
+) -> list[tuple[str, str]]:
+    """Auto-detect calm ("low_vol") stretches across the full history, long
+    enough and far enough from every labeled event to serve as additional
+    reference/calibration periods -- reuses `volatility_regime_labels`
+    (already computes a per-day low/high-vol split) rather than a separate
+    detector. Returns (start, end) ISO date-string pairs, sorted by start.
+
+    A stretch survives if it's a contiguous "low_vol" run of at least
+    `min_length_days`, and doesn't come within `event_buffer_days` of any
+    labeled event window in `events` (configs/horizons.yaml's `events` dict).
+    """
+    labels = volatility_regime_labels(daily_close, vol_window=vol_window, quantile=quantile).dropna()
+
+    # Group into contiguous runs of the same label via a change-point cumsum.
+    run_id = (labels != labels.shift(1)).cumsum()
+    candidates = []
+    for _, run in labels.groupby(run_id):
+        if run.iloc[0] != "low_vol":
+            continue
+        start, end = run.index[0], run.index[-1]
+        if (end - start).days + 1 < min_length_days:
+            continue
+        candidates.append((start, end))
+
+    buffer = pd.Timedelta(days=event_buffer_days)
+    event_windows = [
+        (pd.Timestamp(ev["start"], tz="UTC") - buffer, pd.Timestamp(ev["end"], tz="UTC") + buffer)
+        for ev in events.values()
+    ]
+
+    def overlaps_any_event(start: pd.Timestamp, end: pd.Timestamp) -> bool:
+        return any(start <= ev_end and end >= ev_start for ev_start, ev_end in event_windows)
+
+    calm = [(s, e) for s, e in candidates if not overlaps_any_event(s, e)]
+    calm.sort(key=lambda p: p[0])
+    return [(s.strftime("%Y-%m-%d"), e.strftime("%Y-%m-%d")) for s, e in calm]
+
+
 def score_near_transitions(
     score_series: pd.Series,
     transition_dates: pd.DatetimeIndex,
