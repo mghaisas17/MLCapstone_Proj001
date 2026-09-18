@@ -1,21 +1,21 @@
-Horizon,HorizonKey,Experiment,Setting,Model,RMSE,MAE,QLIKE
-5 min,5m,Baseline,Depth 3 | full path | lead-lag + time,HAR,0.0003770431794449178,0.00023266932572403053,-13.20876032548188
-5 min,5m,Baseline,Depth 3 | full path | lead-lag + time,Random Forest,0.0004810730063533235,0.0003244044475191281,-13.161603718729614
-5 min,5m,Baseline,Depth 3 | full path | lead-lag + time,Signature Ridge,0.000466613799855258,0.00029502013485289735,2000.0921608383253
-5 min,5m,Baseline,Depth 3 | full path | lead-lag + time,Signature XGBoost,0.00042468184113545555,0.0002678690248321664,-13.127327709460573
-1 hour,1h,Baseline,Depth 3 | full path | lead-lag + time,HAR,0.0012490341388583157,0.0008775605280485858,-10.338301159534474
-1 hour,1h,Baseline,Depth 3 | full path | lead-lag + time,Random Forest,0.002683048808490305,0.002035755506406891,-10.040439723845466
-1 hour,1h,Baseline,Depth 3 | full path | lead-lag + time,Signature Ridge,0.0018991106260149064,0.00137011188518146,-9.532877237365678
-1 hour,1h,Baseline,Depth 3 | full path | lead-lag + time,Signature XGBoost,0.0015133888585638167,0.0010443732090708283,-10.179658986825562
-1 day,1d,Baseline,Depth 3 | full path | lead-lag + time,HAR,0.010062045889691668,0.0072458671530727875,-6.716804277017264
-1 day,1d,Baseline,Depth 3 | full path | lead-lag + time,Random Forest,0.011678959801358822,0.009206769932346294,-6.678711492864585
-1 day,1d,Baseline,Depth 3 | full path | lead-lag + time,Signature Ridge,0.009558502667704317,0.0067883037942816915,-6.707921423596088
-1 day,1d,Baseline,Depth 3 | full path | lead-lag + time,Signature XGBoost,0.010076788303190289,0.007143598895750402,-6.680510734067341
-7 day,7d,Baseline,Depth 3 | full path | lead-lag + time,HAR,0.019944073341008506,0.015829097070802566,-4.691496272817144
-7 day,7d,Baseline,Depth 3 | full path | lead-lag + time,Random Forest,0.031780312399468956,0.028612854487704176,-4.522382131208903
-7 day,7d,Baseline,Depth 3 | full path | lead-lag + time,Signature Ridge,0.019154337770653215,0.014507531070807952,-4.698751907116724
-7 day,7d,Baseline,Depth 3 | full path | lead-lag + time,Signature XGBoost,0.02364411929237744,0.017223056413495516,-4.657959261377578
-30 day,30d,Baseline,Depth 3 | full path | lead-lag + time,HAR,0.041608545646847295,0.0369323389701903,-3.145511505844872
-30 day,30d,Baseline,Depth 3 | full path | lead-lag + time,Random Forest,0.0595730956045746,0.052316570250703104,-3.0428881455454873
-30 day,30d,Baseline,Depth 3 | full path | lead-lag + time,Signature Ridge,0.03991649856772663,0.03534482665251093,-3.1539450489282124
-30 day,30d,Baseline,Depth 3 | full path | lead-lag + time,Signature XGBoost,0.045744328329895514,0.0382095603330648,-3.1291665479414688
+Horizon,HorizonKey,Experiment,Setting,Model,RMSE
+5 min,5m,Baseline,Depth 3 | full path | lead-lag + time,XGBoost (stats),0.0004189136921737732
+5 min,5m,Baseline,Depth 3 | full path | lead-lag + time,XGBoost (signature),0.00042468184113545555
+5 min,5m,Baseline,Depth 3 | full path | lead-lag + time,Signature Ridge,0.000466613799855258
+5 min,5m,Baseline,Depth 3 | full path | lead-lag + time,HAR-RV-L,0.0006122355177382365
+1 hour,1h,Baseline,Depth 3 | full path | lead-lag + time,HAR-RV-L,0.001314880459297635
+1 hour,1h,Baseline,Depth 3 | full path | lead-lag + time,XGBoost (signature),0.0015133888585638167
+1 hour,1h,Baseline,Depth 3 | full path | lead-lag + time,XGBoost (stats),0.0016605707576060908
+1 hour,1h,Baseline,Depth 3 | full path | lead-lag + time,Signature Ridge,0.0018991106260149064
+1 day,1d,Baseline,Depth 3 | full path | lead-lag + time,Signature Ridge,0.009558502667704317
+1 day,1d,Baseline,Depth 3 | full path | lead-lag + time,XGBoost (signature),0.010076788303190289
+1 day,1d,Baseline,Depth 3 | full path | lead-lag + time,HAR-RV-L,0.010640375432743114
+1 day,1d,Baseline,Depth 3 | full path | lead-lag + time,XGBoost (stats),0.012353182168946522
+7 day,7d,Baseline,Depth 3 | full path | lead-lag + time,Signature Ridge,0.019154337770653215
+7 day,7d,Baseline,Depth 3 | full path | lead-lag + time,HAR-RV-L,0.02244961251870754
+7 day,7d,Baseline,Depth 3 | full path | lead-lag + time,XGBoost (signature),0.02364411929237744
+7 day,7d,Baseline,Depth 3 | full path | lead-lag + time,XGBoost (stats),0.0398523733231634
+30 day,30d,Baseline,Depth 3 | full path | lead-lag + time,Signature Ridge,0.03991649856772663
+30 day,30d,Baseline,Depth 3 | full path | lead-lag + time,XGBoost (signature),0.045744328329895514
+30 day,30d,Baseline,Depth 3 | full path | lead-lag + time,HAR-RV-L,0.04801831138055093
+30 day,30d,Baseline,Depth 3 | full path | lead-lag + time,XGBoost (stats),0.07950532627348059

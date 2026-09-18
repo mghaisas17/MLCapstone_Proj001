@@ -1,31 +1,31 @@
-Horizon,HorizonKey,Experiment,Setting,Model,RMSE,MAE,QLIKE
-5 min,5m,Dimensions,Price,Signature Ridge,0.0005000972243906273,0.0003128451947070149,-12.727219227644227
-5 min,5m,Dimensions,Price + activity,Signature Ridge,0.00045337711157760065,0.0002851919636632761,-12.842258301677171
-5 min,5m,Dimensions,Price + activity + flow,Signature Ridge,0.000466613799855258,0.00029502013485289735,2000.0921608383253
-5 min,5m,Dimensions,Price,Signature XGBoost,0.0004229249863418594,0.00026293750394264687,-13.091577064220523
-5 min,5m,Dimensions,Price + activity,Signature XGBoost,0.0004160176720594792,0.00026163101958064447,-13.125722247904312
-5 min,5m,Dimensions,Price + activity + flow,Signature XGBoost,0.00042468184113545555,0.0002678690248321664,-13.127327709460573
-1 hour,1h,Dimensions,Price,Signature Ridge,0.0018140029205011548,0.0012718851691412663,-9.763323975108458
-1 hour,1h,Dimensions,Price + activity,Signature Ridge,0.0018308894410928001,0.001324048401026327,-9.535018352420641
-1 hour,1h,Dimensions,Price + activity + flow,Signature Ridge,0.0018991106260149064,0.00137011188518146,-9.532877237365678
-1 hour,1h,Dimensions,Price,Signature XGBoost,0.0015785641718259968,0.0010680284326048826,-10.168031988447716
-1 hour,1h,Dimensions,Price + activity,Signature XGBoost,0.001608568270300478,0.0011154537334934706,-10.142796537665234
-1 hour,1h,Dimensions,Price + activity + flow,Signature XGBoost,0.0015133888585638167,0.0010443732090708283,-10.179658986825562
-1 day,1d,Dimensions,Price,Signature Ridge,0.009831118256820114,0.007155315826656585,-6.692384328271943
-1 day,1d,Dimensions,Price + activity,Signature Ridge,0.009666637796104003,0.007116667201416087,-6.721348237665477
-1 day,1d,Dimensions,Price + activity + range,Signature Ridge,0.009558502667704317,0.0067883037942816915,-6.707921423596088
-1 day,1d,Dimensions,Price,Signature XGBoost,0.010102145736535144,0.007165478407069273,-6.668945459800333
-1 day,1d,Dimensions,Price + activity,Signature XGBoost,0.009784728478092081,0.007031949996448976,-6.657884158020957
-1 day,1d,Dimensions,Price + activity + range,Signature XGBoost,0.010076788303190289,0.007143598895750402,-6.680510734067341
-7 day,7d,Dimensions,Price,Signature Ridge,0.019778782024852715,0.015658151921401606,-4.6905988747860246
-7 day,7d,Dimensions,Price + activity,Signature Ridge,0.019593376579988803,0.015273904354614254,-4.696039621385334
-7 day,7d,Dimensions,Price + activity + range,Signature Ridge,0.019154337770653215,0.014507531070807952,-4.698751907116724
-7 day,7d,Dimensions,Price,Signature XGBoost,0.023381199117485797,0.016902068741696714,-4.663390082924436
-7 day,7d,Dimensions,Price + activity,Signature XGBoost,0.021431550404222528,0.016281908312446088,-4.662988747692655
-7 day,7d,Dimensions,Price + activity + range,Signature XGBoost,0.02364411929237744,0.017223056413495516,-4.657959261377578
-30 day,30d,Dimensions,Price,Signature Ridge,0.04119188526924196,0.0368465496098821,-3.1472348048164607
-30 day,30d,Dimensions,Price + activity,Signature Ridge,0.049252558128805704,0.043823744953923036,-3.096299076610208
-30 day,30d,Dimensions,Price + activity + range,Signature Ridge,0.03991649856772663,0.03534482665251093,-3.1539450489282124
-30 day,30d,Dimensions,Price,Signature XGBoost,0.03955448816778629,0.033634781573037766,-3.162874012887675
-30 day,30d,Dimensions,Price + activity,Signature XGBoost,0.0453131180213311,0.03746963916093671,-3.132884208678067
-30 day,30d,Dimensions,Price + activity + range,Signature XGBoost,0.045744328329895514,0.0382095603330648,-3.1291665479414688
+Horizon,HorizonKey,Experiment,Setting,Model,RMSE
+5 min,5m,Dimensions,Price + activity,Signature XGBoost,0.0004160176720594792
+5 min,5m,Dimensions,Price,Signature XGBoost,0.0004229249863418594
+5 min,5m,Dimensions,Price + activity + flow,Signature XGBoost,0.00042468184113545555
+5 min,5m,Dimensions,Price + activity,Signature Ridge,0.00045337711157760065
+5 min,5m,Dimensions,Price + activity + flow,Signature Ridge,0.000466613799855258
+5 min,5m,Dimensions,Price,Signature Ridge,0.0005000972243906273
+1 hour,1h,Dimensions,Price + activity + flow,Signature XGBoost,0.0015133888585638167
+1 hour,1h,Dimensions,Price,Signature XGBoost,0.0015785641718259968
+1 hour,1h,Dimensions,Price + activity,Signature XGBoost,0.001608568270300478
+1 hour,1h,Dimensions,Price,Signature Ridge,0.0018140029205011548
+1 hour,1h,Dimensions,Price + activity,Signature Ridge,0.0018308894410928001
+1 hour,1h,Dimensions,Price + activity + flow,Signature Ridge,0.0018991106260149064
+1 day,1d,Dimensions,Price + activity + range,Signature Ridge,0.009558502667704317
+1 day,1d,Dimensions,Price + activity,Signature Ridge,0.009666637796104003
+1 day,1d,Dimensions,Price + activity,Signature XGBoost,0.009784728478092081
+1 day,1d,Dimensions,Price,Signature Ridge,0.009831118256820114
+1 day,1d,Dimensions,Price + activity + range,Signature XGBoost,0.010076788303190289
+1 day,1d,Dimensions,Price,Signature XGBoost,0.010102145736535144
+7 day,7d,Dimensions,Price + activity + range,Signature Ridge,0.019154337770653215
+7 day,7d,Dimensions,Price + activity,Signature Ridge,0.019593376579988803
+7 day,7d,Dimensions,Price,Signature Ridge,0.019778782024852715
+7 day,7d,Dimensions,Price + activity,Signature XGBoost,0.021431550404222528
+7 day,7d,Dimensions,Price,Signature XGBoost,0.023381199117485797
+7 day,7d,Dimensions,Price + activity + range,Signature XGBoost,0.02364411929237744
+30 day,30d,Dimensions,Price,Signature XGBoost,0.03955448816778629
+30 day,30d,Dimensions,Price + activity + range,Signature Ridge,0.03991649856772663
+30 day,30d,Dimensions,Price,Signature Ridge,0.04119188526924196
+30 day,30d,Dimensions,Price + activity,Signature XGBoost,0.0453131180213311
+30 day,30d,Dimensions,Price + activity + range,Signature XGBoost,0.045744328329895514
+30 day,30d,Dimensions,Price + activity,Signature Ridge,0.049252558128805704

@@ -108,6 +108,8 @@ class ForecastDataset:
     X_sig: np.ndarray
     har_names: list[str]
     stat_names: list[str]
+    y_har_log: np.ndarray  # log(mean future RV over horizon + EPS): the HAR model's own target
+    X_seq: np.ndarray | None = None  # (n, n_chunks, sig_dim) sub-window signature sequence, LSTM-only
 
 
 STAT_NAMES = [
@@ -398,16 +400,41 @@ def load_or_download_data(
     raise ValueError("source must be 'binance' or 'yahoo'")
 
 
+def validate_ohlc(bars: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop bars with a non-positive open/high/low/close. A $0 (or negative)
+    price is invalid market data, not a modeling edge case -- left in place
+    it turns into inf the moment any log-ratio touches it (Garman-Klass's
+    log(high/low), close-to-close log-returns, the HAR leverage term).
+    Logs the dropped timestamps so the source data can be inspected.
+    """
+    cols = [c for c in ("open", "high", "low", "close") if c in bars.columns]
+    bad = (bars[cols] <= 0).any(axis=1)
+    if bad.any():
+        LOGGER.warning(
+            "Dropping %d bar(s) with non-positive OHLC (invalid market data), e.g. at %s",
+            int(bad.sum()), list(bars.index[bad][:5]),
+        )
+        bars = bars.loc[~bad]
+    return bars
+
+
 def add_variance_increment(bars: pd.DataFrame, method: str = "close") -> pd.DataFrame:
-    bars = bars.copy()
+    bars = validate_ohlc(bars).copy()
     if method == "close":
         r = np.log(bars["close"]).diff()
-        bars["var_inc"] = r**2
+        # The very first bar has no prior price, so diff() leaves it NaN --
+        # left unfixed, any window whose largest HAR span equals the full
+        # lookback (true for the 5m/1h specs) includes that NaN in its very
+        # first sample, which then poisons log_RV/leverage with NaN/inf.
+        bars["var_inc"] = (r**2).fillna(0.0)
     elif method == "gk":
         log_hl = np.log(bars["high"] / bars["low"])
         log_co = np.log(bars["close"] / bars["open"])
-        gk = 0.5 * log_hl**2 - (2 * np.log(2) - 1) * log_co**2
-        bars["var_inc"] = gk.clip(lower=0)
+        # Garman-Klass is a per-bar *estimator*, not a variance itself, and can
+        # be negative on any single bar; only the aggregate (sum/mean over a
+        # window) should be floored at zero, so no floor is applied here.
+        bars["var_inc"] = 0.5 * log_hl**2 - (2 * np.log(2) - 1) * log_co**2
     else:
         raise ValueError("method must be 'close' or 'gk'")
     return bars
@@ -534,6 +561,34 @@ def summary_features(window: pd.DataFrame) -> np.ndarray:
     )
 
 
+def future_volatility_target(bars: pd.DataFrame, i: int, horizon_steps: int) -> float:
+    """sqrt(sum of var_inc over the horizon) -- the common y every model is scored
+    against, regardless of what scale/transform it was fit in."""
+    future_var = bars["var_inc"].iloc[i + 1 : i + 1 + horizon_steps].sum()
+    return float(np.sqrt(max(future_var, 0)))
+
+
+def har_log_features(bars: pd.DataFrame, i: int, har_steps: list[int]) -> np.ndarray:
+    """
+    Crypto-style HAR-RV-L features at index i: log(RV) averaged over each
+    HAR window (RV(1), RV(7), RV(30), ...), plus a leverage/asymmetry term
+    (Corsi & Reno's HAR-RV-L) using the sign of the most recent daily return.
+    """
+    var_inc = bars["var_inc"].to_numpy()
+    log_rvs = [
+        np.log(max(var_inc[i - w + 1 : i + 1].mean(), 0.0) + EPS) for w in har_steps
+    ]
+    ret = np.log(bars["close"].iloc[i] / bars["close"].iloc[i - 1])
+    leverage = min(ret, 0.0)
+    return np.array([*log_rvs, leverage], dtype=np.float32)
+
+
+def har_log_target(bars: pd.DataFrame, i: int, horizon_steps: int) -> float:
+    """log(mean future RV over the horizon + EPS): z_t = log(1/h * sum RV_{t+j} + eps)."""
+    future_mean_var = bars["var_inc"].iloc[i + 1 : i + 1 + horizon_steps].mean()
+    return float(np.log(max(future_mean_var, 0.0) + EPS))
+
+
 def duration_steps(duration: str, bar_freq: str) -> int:
     duration_td = pd.Timedelta(duration)
     bar_td = pd.Timedelta(bar_freq)
@@ -543,17 +598,43 @@ def duration_steps(duration: str, bar_freq: str) -> int:
     return steps
 
 
+def chunk_signatures(window: pd.DataFrame, sub_window_steps: int, spec: ForecastSpec) -> np.ndarray:
+    """
+    Split an *already-sliced* lookback window (the same one build_dataset just
+    used for the full-window signature) into consecutive sub-window chunks
+    and compute one signature per chunk -- this is what the LSTM consumes.
+    Reusing the window slice avoids re-walking `bars` a second time.
+    """
+    n_chunks = max(1, len(window) // sub_window_steps)
+    chunks = [window.iloc[k * sub_window_steps : (k + 1) * sub_window_steps] for k in range(n_chunks)]
+    return np.stack(
+        [signature_features(make_path(chunk, spec), spec.depth) for chunk in chunks if len(chunk) >= 2]
+    )
+
+
 def build_dataset(
     bars: pd.DataFrame,
     spec: ForecastSpec,
     progress_every: int | None = None,
+    include_lstm_seq: bool = False,
+    sub_window: str = "5D",
 ) -> ForecastDataset:
+    """
+    Single pass over `bars` that builds every feature representation at once
+    (HAR, summary stats, full-window signature, and -- only if requested --
+    the LSTM's per-sub-window signature sequence). Building the LSTM sequence
+    here, from the *same* sliced `window`, avoids a second walk over `bars`
+    and avoids ever holding two independently-built copies of the dataset in
+    memory; `include_lstm_seq=False` (the default) skips that extra work
+    entirely for experiments that don't need it.
+    """
     LOGGER.info("Building forecast dataset for horizon=%s", spec.name)
     bars = add_variance_increment(bars, method=spec.variance_method)
 
     horizon_steps = duration_steps(spec.horizon, spec.bar_freq)
     lookback_steps = duration_steps(spec.lookback, spec.bar_freq)
     har_steps = [duration_steps(w, spec.bar_freq) for w in spec.har_windows]
+    sub_window_steps = duration_steps(sub_window, spec.bar_freq) if include_lstm_seq else None
     min_history = max(lookback_steps, max(har_steps))
 
     candidate_indices = range(
@@ -572,7 +653,8 @@ def build_dataset(
         progress_every = max(1, total // 20)
 
     times, target_ends = [], []
-    y_list, har_list, stat_list, sig_list = [], [], [], []
+    y_list, har_list, har_log_y_list, stat_list, sig_list = [], [], [], [], []
+    seq_list = [] if include_lstm_seq else None
 
     for count, i in enumerate(candidate_indices, start=1):
         if count == 1 or count % progress_every == 0 or count == total:
@@ -582,20 +664,15 @@ def build_dataset(
         path = make_path(window, spec)
         sig = signature_features(path, spec.depth)
 
-        har = []
-        for w in har_steps:
-            past_var = bars["var_inc"].iloc[i - w + 1 : i + 1].sum()
-            har.append(np.sqrt(max(past_var, 0)))
-
-        future_var = bars["var_inc"].iloc[i + 1 : i + 1 + horizon_steps].sum()
-        target = np.sqrt(max(future_var, 0))
-
         times.append(bars.index[i])
         target_ends.append(bars.index[i + horizon_steps])
-        y_list.append(target)
-        har_list.append(har)
+        y_list.append(future_volatility_target(bars, i, horizon_steps))
+        har_list.append(har_log_features(bars, i, har_steps))
+        har_log_y_list.append(har_log_target(bars, i, horizon_steps))
         stat_list.append(summary_features(window))
         sig_list.append(sig)
+        if include_lstm_seq:
+            seq_list.append(chunk_signatures(window, sub_window_steps, spec))
 
     dataset = ForecastDataset(
         times=np.asarray(times),
@@ -604,15 +681,18 @@ def build_dataset(
         X_har=np.asarray(har_list, dtype=np.float32),
         X_stats=np.asarray(stat_list, dtype=np.float32),
         X_sig=np.asarray(sig_list, dtype=np.float32),
-        har_names=[f"RV_{w}" for w in spec.har_windows],
+        har_names=[f"log_RV_{w}" for w in spec.har_windows] + ["leverage"],
         stat_names=STAT_NAMES.copy(),
+        y_har_log=np.asarray(har_log_y_list, dtype=np.float32),
+        X_seq=np.stack(seq_list).astype(np.float32) if include_lstm_seq else None,
     )
     LOGGER.info(
-        "Finished dataset: n=%s | HAR=%s | stats=%s | signature=%s",
+        "Finished dataset: n=%s | HAR=%s | stats=%s | signature=%s | seq=%s",
         f"{len(dataset.y):,}",
         dataset.X_har.shape[1],
         dataset.X_stats.shape[1],
         dataset.X_sig.shape[1],
+        dataset.X_seq.shape if include_lstm_seq else "skipped",
     )
     return dataset
 
@@ -695,6 +775,7 @@ def save_forecast_dataset(dataset: ForecastDataset, path: str | Path) -> None:
         X_sig=dataset.X_sig,
         har_names=np.asarray(dataset.har_names, dtype=object),
         stat_names=np.asarray(dataset.stat_names, dtype=object),
+        y_har_log=dataset.y_har_log,
     )
     LOGGER.info("Saved forecast dataset to %s", path)
 
@@ -710,4 +791,5 @@ def load_forecast_dataset(path: str | Path) -> ForecastDataset:
         X_sig=data["X_sig"],
         har_names=data["har_names"].tolist(),
         stat_names=data["stat_names"].tolist(),
+        y_har_log=data["y_har_log"],
     )
