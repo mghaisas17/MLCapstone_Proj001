@@ -287,6 +287,62 @@ def binance_to_bars(trades: pd.DataFrame, freq: str) -> pd.DataFrame:
     return bars
 
 
+def load_or_download_binance_bars(
+    start: str | date,
+    end: str | date,
+    freq: str,
+    symbol: str = "BTCUSDT",
+    data_dir: str | Path = "data/binance",
+    force_download: bool = False,
+    skip_unavailable: bool = True,
+    delete_raw_cache: bool = True,
+) -> pd.DataFrame:
+    """Load Binance trades one day at a time and immediately aggregate to bars.
+
+    This is the memory-safe alternative to ``load_or_download_binance`` for
+    forecasting experiments. Only one raw trade day is held in memory and new
+    raw trade parquet files are not created. Existing raw caches can be removed
+    after resampling because they are reproducible and much larger than bars.
+    """
+    data_dir = _ensure_data_dir(data_dir)
+    dates = _inclusive_dates(start, end)
+    daily_bars: list[pd.DataFrame] = []
+
+    for k, day in enumerate(dates, start=1):
+        day_str = day.strftime("%Y-%m-%d")
+        path = data_dir / f"{symbol}_trades_{day_str}.parquet"
+        raw = None
+        if path.exists() and not force_download:
+            LOGGER.info("[%d/%d] Reading cached %s", k, len(dates), path.name)
+            try:
+                raw = pd.read_parquet(path)
+            except Exception:
+                # A disk-full failure can leave a truncated parquet file.
+                path.unlink(missing_ok=True)
+        if raw is None:
+            try:
+                raw = _download_one_binance_day(symbol, day)
+            except FileNotFoundError as exc:
+                if skip_unavailable:
+                    LOGGER.warning("[%d/%d] %s", k, len(dates), exc)
+                    continue
+                raise
+
+        trades = prepare_binance_trades(raw)
+        daily_bars.append(binance_to_bars(trades, freq))
+        if delete_raw_cache and path.exists():
+            path.unlink()
+        del raw, trades
+
+    if not daily_bars:
+        raise ValueError("No Binance data could be loaded for the requested date range.")
+
+    bars = pd.concat(daily_bars).sort_index()
+    bars = bars.loc[~bars.index.duplicated(keep="last")]
+    LOGGER.info("Loaded Binance %s bars: %s", freq, f"{len(bars):,}")
+    return bars
+
+
 def _yahoo_cache_path(data_dir: Path, ticker: str) -> Path:
     safe = ticker.replace("/", "_").replace("-", "_")
     return data_dir / f"{safe}_1d.parquet"
