@@ -110,6 +110,9 @@ class ForecastDataset:
     stat_names: list[str]
     y_har_log: np.ndarray  # log(mean future RV over horizon + EPS): the HAR model's own target
     X_seq: np.ndarray | None = None  # (n, n_chunks, sig_dim) sub-window signature sequence, LSTM-only
+    # Non-signature controls, built from the same window as X_sig:
+    X_lag: np.ndarray | None = None  # flat lag bank with exactly as many columns as X_sig
+    X_multi: np.ndarray | None = None  # hand-built multi-scale realized-volatility features
 
 
 STAT_NAMES = [
@@ -579,6 +582,57 @@ def signature_info(path: np.ndarray, depth: int) -> dict[str, int]:
     }
 
 
+def lag_bank_features(window: pd.DataFrame, spec: ForecastSpec, n_target: int) -> np.ndarray:
+    """Dimension-matched, non-signature control for the signature features.
+
+    Uses exactly the information the signature sees (increments of the same base
+    channels at the same resolution) but as a flat bank of lagged terms instead of
+    iterated integrals, truncated to ``n_target`` columns (= the signature length)
+    in priority order: raw increments, squared increments, contemporaneous
+    cross-channel products, lag-k products (k = 1, 2, ...), absolute increments.
+    If Ridge on this does as well as Ridge on signatures, the gain is not
+    specific to signatures.
+    """
+    path = resample_path(make_base_path(window, spec.dims), spec.path_points)
+    inc = np.diff(path, axis=0)
+    m, d = inc.shape
+    parts = [inc.ravel(), (inc**2).ravel()]
+    if d > 1:
+        parts.append(np.concatenate([inc[:, i] * inc[:, j] for i in range(d) for j in range(i + 1, d)]))
+    lag = 1
+    while sum(p.size for p in parts) < n_target and lag < m:
+        parts.append((inc[lag:] * inc[:-lag]).ravel())
+        lag += 1
+    parts.append(np.abs(inc).ravel())
+    v = np.concatenate(parts)
+    if v.size < n_target:
+        v = np.pad(v, (0, n_target - v.size))
+    return v[:n_target].astype(np.float32)
+
+
+def multiscale_features(window: pd.DataFrame) -> np.ndarray:
+    """Hand-built multi-scale volatility features: at 5 geometrically spaced
+    look-back scales, realized variance, mean absolute return, mean log range,
+    volume, signed return, downside semivariance, largest move and (Binance)
+    signed flow. A strong, signature-free competitor with a few dozen columns."""
+    r = np.diff(np.log(window["close"].to_numpy(float)))
+    hl = np.log(window["high"].to_numpy(float) / window["low"].to_numpy(float))[1:]
+    dv = window["dollar_volume"].to_numpy(float)[1:]
+    flow = window["signed_dollar_flow"].to_numpy(float)[1:] if "signed_dollar_flow" in window.columns else None
+    scales = sorted({max(2, int(round(s))) for s in np.geomspace(2, len(r), 5)})
+    out = []
+    for s in scales:
+        rr = r[-s:]
+        out += [
+            np.log(np.mean(rr**2) + EPS), np.log(np.mean(np.abs(rr)) + EPS),
+            np.log(np.mean(hl[-s:]) + EPS), np.log1p(np.mean(dv[-s:])), rr.sum(),
+            np.log(np.mean(np.minimum(rr, 0.0) ** 2) + EPS), np.log(np.abs(rr).max() + EPS),
+        ]
+        if flow is not None:
+            out.append(flow[-s:].sum() / (dv[-s:].sum() + EPS))
+    return np.asarray(out, dtype=np.float32)
+
+
 def summary_features(window: pd.DataFrame) -> np.ndarray:
     price = window["close"].to_numpy()
     log_price = np.log(price)
@@ -715,6 +769,7 @@ def build_dataset(
 
     times, target_ends = [], []
     y_list, har_list, har_log_y_list, stat_list, sig_list = [], [], [], [], []
+    lag_list, multi_list = [], []
     seq_list = [] if include_lstm_seq else None
 
     for count, i in enumerate(candidate_indices, start=1):
@@ -732,6 +787,8 @@ def build_dataset(
         har_log_y_list.append(har_log_target(bars, i, horizon_steps))
         stat_list.append(summary_features(window))
         sig_list.append(sig)
+        lag_list.append(lag_bank_features(window, spec, sig.shape[0]))
+        multi_list.append(multiscale_features(window))
         if include_lstm_seq:
             seq_list.append(chunk_signatures(window, sub_window_steps, spec))
 
@@ -746,6 +803,8 @@ def build_dataset(
         stat_names=STAT_NAMES.copy(),
         y_har_log=np.asarray(har_log_y_list, dtype=np.float32),
         X_seq=np.stack(seq_list).astype(np.float32) if include_lstm_seq else None,
+        X_lag=np.asarray(lag_list, dtype=np.float32),
+        X_multi=np.asarray(multi_list, dtype=np.float32),
     )
     LOGGER.info(
         "Finished dataset: n=%s | HAR=%s | stats=%s | signature=%s | seq=%s",

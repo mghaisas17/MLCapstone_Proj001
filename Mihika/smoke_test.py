@@ -140,6 +140,47 @@ def test_to_ns():
     ok("datetime handling is independent of pandas resolution")
 
 
+# ---------------------------------------------------------------- controls / tuning / GARCH
+def test_controls_and_tuning():
+    import models_and_metrics as mm
+    for horizon, n_bars, freq in (("1d", 400, "1D"), ("5m", 4000, "5s")):
+        bars = synth_bars(n_bars, freq, horizon == "5m")
+        spec = ex.base_spec_for(horizon, bars, ex.ExperimentConfig(target_rows={horizon: 40}))
+        ds = fd.build_dataset(bars, spec)
+        assert ds.X_lag.shape == ds.X_sig.shape, (ds.X_lag.shape, ds.X_sig.shape)
+        assert ds.X_multi.shape[0] == len(ds.y) and np.isfinite(ds.X_multi).all() and np.isfinite(ds.X_lag).all()
+    ok("lag-bank control has exactly as many columns as the signature (daily and intraday specs)")
+
+    n = 300
+    times = pd.date_range("2020-01-01", periods=n, freq="D", tz="UTC")
+    target_end = times + pd.Timedelta(days=10)
+    fit, val = mm.inner_holdout(times, target_end)
+    assert (target_end[fit] < times[val[0]]).all() and fit.max() < val.min()
+    X = rng.normal(size=(n, 12))
+    y = np.abs(X[:, 0]) + 0.1 * rng.normal(size=n)
+    xgb = mm.fit_xgb_tuned(X, y, fit, val, max_estimators=40)
+    mlp = mm.fit_mlp_tuned(X, y, fit, val, max_epochs=4, patience=2)
+    lstm = mm.fit_lstm_tuned(X.reshape(n, 3, 4), y, fit, val, max_epochs=4, patience=2)
+    for model, Xt in ((xgb, X), (mlp, X), (lstm, X.reshape(n, 3, 4))):
+        assert np.isfinite(model.predict(Xt)).all() and model.tuned_
+    ok("tuned XGBoost / MLP / LSTM fit on a purged inner holdout and predict")
+
+
+def test_garch_rolling():
+    import models_and_metrics as mm
+    n = 1500
+    sd = np.where(np.arange(n) < 600, 0.05, 0.01)  # volatility level drops: a stale long-run variance
+    r = pd.Series(rng.normal(0, 1, n) * sd, index=pd.date_range("2018-01-01", periods=n, freq="D", tz="UTC"))
+    anchors = r.index[1000:1300:5]
+    h = 30
+    y = np.array([np.sqrt((r.loc[a:].iloc[1:h + 1] ** 2).sum()) for a in anchors])
+    roll = mm.evaluate_garch_rolling(r, anchors, y, h, window=400, refit_every=30).predictions
+    fixed = mm.evaluate_garch(r.loc[: r.index[999]], r, anchors, y, h).predictions
+    assert np.isfinite(roll).all() and np.isfinite(fixed).all()
+    b_roll, b_fix = roll.mean() / y.mean(), fixed.mean() / y.mean()
+    ok(f"rolling GARCH runs (mean forecast / realized: rolling {b_roll:.2f} vs fixed {b_fix:.2f} on a series with a volatility-level drop)")
+
+
 # ---------------------------------------------------------------- synthetic bars
 def synth_bars(n, freq, binance):
     idx = pd.date_range("2024-01-01", periods=n, freq=freq, tz="UTC")
@@ -178,8 +219,9 @@ def test_pipeline(tmp):
     assert set(res.meta) == set(ex.HORIZON_LABELS), res.meta.keys()
     assert res.metrics.Fold.nunique() == cfg.n_folds
     # GARCH only on daily horizons; every other model on every horizon
-    garch = set(res.metrics[res.metrics.Model == "GARCH(1,1)"].HorizonKey)
-    assert garch == set(ex.DAILY_HORIZONS), garch
+    for g in ("GARCH(1,1) | fixed", "GARCH(1,1) | rolling refit"):
+        garch = set(res.metrics[res.metrics.Model == g].HorizonKey)
+        assert garch == set(ex.DAILY_HORIZONS), (g, garch)
     assert np.isfinite(res.metrics.RMSE).all()
     for m in ex.MODELS:
         assert m in set(res.metrics.Model), m
@@ -217,6 +259,12 @@ def test_pipeline(tmp):
         assert t.Best.sum() == 1 and len(t) >= 9
     ok("summary + Diebold-Mariano tables")
 
+    ct = rp.control_table(res)
+    assert set(ct.Control) == set(rp.CONTROLS) and np.isfinite(ct.RMSE_control).all()
+    bt = rp.bias_table(res)
+    assert {"Fold 1", "Fold 3", "Pooled"} <= set(bt.columns) and np.isfinite(bt.Pooled).all()
+    ok("control table (signature vs signature-free) and bias table")
+
     eff = rp.flag_effect_table(res)
     assert len(eff) == 4 * len(ex.HORIZON_LABELS) and np.isfinite(eff.RMSE_base_all).all()
     diag = rp.flag_diagnostics_table(res)
@@ -238,6 +286,8 @@ if __name__ == "__main__":
         test_purge()
         test_hmm()
         test_to_ns()
+        test_garch_rolling()
         test_loader(tmp)
+        test_controls_and_tuning()
         test_pipeline(tmp)
     print("\nALL SMOKE CHECKS PASSED")

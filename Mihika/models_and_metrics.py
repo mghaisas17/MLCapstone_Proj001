@@ -404,3 +404,164 @@ def compare_models(results: dict[str, WalkForwardResult], horizon_steps: int) ->
             {"Model": name, "RMSE": res.rmse, "Best": is_best, "DM stat vs best": dm_stat, "DM p-value": p_value}
         )
     return pd.DataFrame(rows).sort_values("RMSE").reset_index(drop=True)
+
+
+# --------------------------------------------------------------------------
+# Equal tuning effort for the nonlinear models
+#
+# Ridge picks its alpha with an inner purged walk-forward CV. XGBoost, the MLP
+# and the LSTM used to run with fixed hyperparameters, which made "linear beats
+# nonlinear" partly a tuning-effort result. These helpers give them a small grid
+# plus early stopping, scored on a purged *inner holdout* (the last part of the
+# training rows) so nothing from the test block is ever used.
+# --------------------------------------------------------------------------
+
+
+def inner_holdout(times, target_end, val_frac: float = 0.2) -> tuple[np.ndarray, np.ndarray]:
+    """Positions (within the training rows) of an inner fit set and a later
+    validation set. Fit rows whose label window reaches the validation block are
+    purged, exactly as in the outer CV."""
+    n = len(times)
+    cut = int(n * (1 - val_frac))
+    val = np.arange(cut, n)
+    fit = np.arange(0, cut)
+    fit = fit[np.asarray(target_end[fit] < times[val[0]])]
+    if len(fit) < 20 or len(val) < 10:
+        raise ValueError(f"Inner holdout too small to tune on (fit={len(fit)}, val={len(val)}).")
+    return fit, val
+
+
+def _xgb_model(max_depth, reg_lambda, n_estimators, seed, early_stopping_rounds=None):
+    return XGBRegressor(
+        objective="reg:squarederror", n_estimators=n_estimators, max_depth=max_depth,
+        learning_rate=0.05, subsample=0.8, colsample_bytree=0.7, reg_alpha=0.1,
+        reg_lambda=reg_lambda, tree_method="hist", n_jobs=1, random_state=seed,
+        early_stopping_rounds=early_stopping_rounds,
+    )
+
+
+def fit_xgb_tuned(X, y, fit_idx, val_idx, *, max_estimators: int = 500, random_state: int = 42):
+    """Grid over depth and L2 with early stopping on the inner holdout, then a
+    refit on all training rows with the chosen depth/L2 and number of trees."""
+    best = None
+    for depth in (2, 3, 5):
+        for lam in (1.0, 10.0):
+            m = _xgb_model(depth, lam, max_estimators, random_state, early_stopping_rounds=30)
+            m.fit(X[fit_idx], y[fit_idx], eval_set=[(X[val_idx], y[val_idx])], verbose=False)
+            score, iters = float(m.best_score), int(m.best_iteration) + 1
+            if best is None or score < best[0]:
+                best = (score, depth, lam, iters)
+    _, depth, lam, iters = best
+    final = _xgb_model(depth, lam, iters, random_state)
+    final.fit(X, y)
+    final.tuned_ = {"max_depth": depth, "reg_lambda": lam, "n_estimators": iters}
+    return final
+
+
+def _train_torch_val(model, Xf, yf, Xv, yv, *, weight_decay, max_epochs, patience, lr=1e-3,
+                     batch_size=64, random_state=42):
+    """Train with early stopping on a validation set; returns (best_epoch, best_val_mse)."""
+    torch.manual_seed(random_state)
+    Xf_t, yf_t = torch.tensor(Xf, dtype=torch.float32), torch.tensor(yf, dtype=torch.float32)
+    Xv_t, yv_t = torch.tensor(Xv, dtype=torch.float32), torch.tensor(yv, dtype=torch.float32)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(Xf_t, yf_t), batch_size=min(batch_size, len(Xf_t)), shuffle=True
+    )
+    best_val, best_epoch, since = np.inf, 1, 0
+    for epoch in range(1, max_epochs + 1):
+        model.train()
+        for xb, yb in loader:
+            opt.zero_grad()
+            nn.functional.mse_loss(model(xb), yb).backward()
+            opt.step()
+        model.eval()
+        with torch.no_grad():
+            val = float(nn.functional.mse_loss(model(Xv_t), yv_t))
+        if val < best_val - 1e-12:
+            best_val, best_epoch, since = val, epoch, 0
+        else:
+            since += 1
+            if since >= patience:
+                break
+    return best_epoch, best_val
+
+
+def _fit_torch_tuned(build, X, y, fit_idx, val_idx, grid, *, max_epochs, patience, random_state):
+    """Pick (weight_decay, architecture) and epoch count on the inner holdout, then
+    retrain from scratch on all training rows for that many epochs."""
+    scaler_fit = _fit_scaler(X[fit_idx])
+    Xf = _scale(scaler_fit, X[fit_idx])
+    Xv = _scale(scaler_fit, X[val_idx])
+    best = None
+    for wd, arch in grid:
+        torch.manual_seed(random_state)
+        epoch, val = _train_torch_val(
+            build(arch), Xf, y[fit_idx], Xv, y[val_idx], weight_decay=wd,
+            max_epochs=max_epochs, patience=patience, random_state=random_state,
+        )
+        if best is None or val < best[0]:
+            best = (val, wd, arch, epoch)
+    _, wd, arch, epoch = best
+    scaler = _fit_scaler(X)
+    model = _train_torch(
+        build(arch), _scale(scaler, X), y, weight_decay=wd, epochs=max(epoch, 5), random_state=random_state
+    )
+    reg = TorchRegressor(model, scaler)
+    reg.tuned_ = {"weight_decay": wd, "arch": arch, "epochs": epoch}
+    return reg
+
+
+def _scale(scaler, X):
+    if X.ndim == 3:
+        n, t, f = X.shape
+        return scaler.transform(X.reshape(-1, f)).reshape(n, t, f)
+    return scaler.transform(X)
+
+
+def fit_mlp_tuned(X, y, fit_idx, val_idx, *, max_epochs=200, patience=20, random_state=42):
+    d = X.shape[1]
+    grid = [(wd, h) for wd in (1e-4, 1e-3, 1e-2) for h in ((128, 64, 16), (32,))]
+    return _fit_torch_tuned(lambda h: MLP(d, h), X, y, fit_idx, val_idx, grid,
+                            max_epochs=max_epochs, patience=patience, random_state=random_state)
+
+
+def fit_lstm_tuned(X_seq, y, fit_idx, val_idx, *, max_epochs=200, patience=20, random_state=42):
+    f = X_seq.shape[-1]
+    grid = [(wd, h) for wd in (1e-4, 1e-3, 1e-2) for h in (16, 32)]
+    return _fit_torch_tuned(lambda h: SignatureLSTM(f, h), X_seq, y, fit_idx, val_idx, grid,
+                            max_epochs=max_epochs, patience=patience, random_state=random_state)
+
+
+# --------------------------------------------------------------------------
+# GARCH(1,1) refit on a rolling window
+#
+# The original GARCH was fit once on the whole training period and then held
+# fixed. For a series whose volatility level drifts (BTC volatility fell over
+# the years) long-horizon forecasts then revert to an out-of-date long-run
+# variance. This version refits every `refit_every` rows on the trailing
+# `window` returns, using only returns up to the first anchor of each segment.
+# --------------------------------------------------------------------------
+
+
+def evaluate_garch_rolling(
+    returns: pd.Series,
+    anchor_times: pd.DatetimeIndex,
+    y_test: np.ndarray,
+    horizon_steps: int,
+    window: int = 1000,
+    refit_every: int = 30,
+    vol: str = "GARCH",
+) -> ModelResult:
+    preds = np.empty(len(anchor_times))
+    for start in range(0, len(anchor_times), refit_every):
+        segment = anchor_times[start : start + refit_every]
+        train = returns.loc[: segment[0]].iloc[-window:]
+        res = fit_garch(train, vol=vol)
+        preds[start : start + len(segment)] = garch_cumulative_forecast(
+            res, returns, segment, horizon_steps, vol=vol
+        )
+    return ModelResult(
+        name="GARCH(1,1) | rolling refit", model=None, predictions=preds,
+        metrics=regression_metrics(y_test, preds),
+    )

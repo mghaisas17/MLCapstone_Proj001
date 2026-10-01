@@ -49,15 +49,20 @@ from forecast_data import (
 from models_and_metrics import (
     EPS,
     evaluate_garch,
+    evaluate_garch_rolling,
     evaluate_har_log,
+    fit_lstm_tuned,
     fit_mlp,
+    fit_mlp_tuned,
     fit_signature_lstm,
     fit_xgb,
+    fit_xgb_tuned,
+    inner_holdout,
 )
 
 LOGGER = logging.getLogger(__name__)
 
-FEATURE_VERSION = 1  # bump to invalidate cached feature files
+FEATURE_VERSION = 2  # bump to invalidate cached feature files
 HORIZON_LABELS = {"5m": "5 min", "1h": "1 hour", "1d": "1 day", "7d": "7 day", "30d": "30 day"}
 BINANCE_HORIZONS = ("5m", "1h")
 DAILY_HORIZONS = ("1d", "7d", "30d")
@@ -96,8 +101,15 @@ class ExperimentConfig:
     lstm_sub_window: dict = field(
         default_factory=lambda: {"5m": "30min", "1h": "6h", "1d": "5D", "7d": "5D", "30d": "5D"}
     )
-    xgb_estimators: int = 500
+    xgb_estimators: int = 500  # max trees (early stopping picks the number when tuning)
     seed: int = 42
+    # Tune XGBoost / MLP / LSTM with a small grid + early stopping on a purged inner
+    # holdout (the same effort Ridge gets from its inner CV). False = fixed settings.
+    tune_nonlinear: bool = True
+    nn_patience: int = 20
+    # GARCH(1,1) is refit every `garch_refit_every` rows on the trailing `garch_window` returns
+    garch_window: int = 1000
+    garch_refit_every: int = 30
 
     # ablations (signature level / augmentation / dimensions), same folds
     run_ablations: bool = True
@@ -280,6 +292,8 @@ class FoldContext:
             "stats+sig": np.hstack([d.X_stats, d.X_sig]),
             "har": d.X_har,
             "seq": d.X_seq,
+            "lag": d.X_lag,
+            "multi": d.X_multi,
         }[kind]
 
     def xy(self, kind: str):
@@ -307,6 +321,13 @@ def _har(c):
     ).predictions
 
 
+def _garch_rolling(c):
+    anchors = pd.DatetimeIndex(c.ds.times[c.fold.test])
+    return evaluate_garch_rolling(
+        c.returns, anchors, c.y_test, c.horizon_steps, c.cfg.garch_window, c.cfg.garch_refit_every
+    ).predictions
+
+
 def _garch(c):
     times = c.ds.times
     returns_train = c.returns.loc[: times[c.fold.train[-1]]]
@@ -326,11 +347,19 @@ def _ridge(kind):
     return run
 
 
+def _fit_xgb(c, X):
+    tr = c.fold.train
+    if c.cfg.tune_nonlinear:
+        fit, val = inner_holdout(c.ds.times[tr], c.ds.target_end[tr])
+        return fit_xgb_tuned(X[tr], c.y_train, fit, val, max_estimators=c.cfg.xgb_estimators,
+                             random_state=c.cfg.seed)
+    return fit_xgb(X[tr], c.y_train, random_state=c.cfg.seed, n_estimators=c.cfg.xgb_estimators)
+
+
 def _xgb(kind):
     def run(c):
-        Xtr, Xte = c.xy(kind)
-        model = fit_xgb(Xtr, c.y_train, random_state=c.cfg.seed, n_estimators=c.cfg.xgb_estimators)
-        return model.predict(Xte)
+        X = c.features(kind)
+        return _fit_xgb(c, X).predict(X[c.fold.test])
 
     return run
 
@@ -338,10 +367,14 @@ def _xgb(kind):
 def _mlp(kind):
     def run(c):
         Xtr, Xte = c.xy(kind)
-        model = fit_mlp(
-            Xtr, c.y_train, weight_decay=c.cfg.weight_decay[c.horizon_key],
-            epochs=c.cfg.torch_epochs, random_state=c.cfg.seed + c.fold.number,
-        )
+        tr, seed = c.fold.train, c.cfg.seed + c.fold.number
+        if c.cfg.tune_nonlinear:
+            fit, val = inner_holdout(c.ds.times[tr], c.ds.target_end[tr])
+            model = fit_mlp_tuned(Xtr, c.y_train, fit, val, max_epochs=c.cfg.torch_epochs,
+                                  patience=c.cfg.nn_patience, random_state=seed)
+        else:
+            model = fit_mlp(Xtr, c.y_train, weight_decay=c.cfg.weight_decay[c.horizon_key],
+                            epochs=c.cfg.torch_epochs, random_state=seed)
         return model.predict(Xte)
 
     return run
@@ -349,10 +382,14 @@ def _mlp(kind):
 
 def _lstm(c):
     Xtr, Xte = c.xy("seq")
-    model = fit_signature_lstm(
-        Xtr, c.y_train, weight_decay=c.cfg.weight_decay[c.horizon_key],
-        epochs=c.cfg.torch_epochs, random_state=c.cfg.seed + c.fold.number,
-    )
+    tr, seed = c.fold.train, c.cfg.seed + c.fold.number
+    if c.cfg.tune_nonlinear:
+        fit, val = inner_holdout(c.ds.times[tr], c.ds.target_end[tr])
+        model = fit_lstm_tuned(Xtr, c.y_train, fit, val, max_epochs=c.cfg.torch_epochs,
+                               patience=c.cfg.nn_patience, random_state=seed)
+    else:
+        model = fit_signature_lstm(Xtr, c.y_train, weight_decay=c.cfg.weight_decay[c.horizon_key],
+                                   epochs=c.cfg.torch_epochs, random_state=seed)
     return model.predict(Xte)
 
 
@@ -370,8 +407,7 @@ def _ridge_flag(c):
 
 def _xgb_flag(c):
     X = np.hstack([c.ds.X_sig, c.flag_cols()])
-    model = fit_xgb(X[c.fold.train], c.y_train, random_state=c.cfg.seed, n_estimators=c.cfg.xgb_estimators)
-    return model.predict(X[c.fold.test])
+    return _fit_xgb(c, X).predict(X[c.fold.test])
 
 
 def _ridge_stress_dim(c):
@@ -384,9 +420,13 @@ MODELS: dict[str, ModelSpec] = {
     for m in [
         ModelSpec("Mean", _mean),
         ModelSpec("HAR-RV-L", _har),
-        ModelSpec("GARCH(1,1)", _garch, horizons=DAILY_HORIZONS),
+        ModelSpec("GARCH(1,1) | fixed", _garch, horizons=DAILY_HORIZONS),
+        ModelSpec("GARCH(1,1) | rolling refit", _garch_rolling, horizons=DAILY_HORIZONS),
         ModelSpec("Ridge | stats", _ridge("stats")),
         ModelSpec("Ridge | signature", _ridge("sig")),
+        # controls: same Ridge, signature-free features (see forecast_data.lag_bank_features)
+        ModelSpec("Ridge | lag bank (matched)", _ridge("lag")),
+        ModelSpec("Ridge | multiscale stats", _ridge("multi")),
         ModelSpec("Ridge | stats+signature", _ridge("stats+sig")),
         ModelSpec("XGBoost | stats", _xgb("stats")),
         ModelSpec("XGBoost | signature", _xgb("sig")),
@@ -523,12 +563,14 @@ def get_dataset(
             X_har=z["X_har"], X_stats=z["X_stats"], X_sig=z["X_sig"],
             har_names=z["har_names"].tolist(), stat_names=z["stat_names"].tolist(),
             y_har_log=z["y_har_log"], X_seq=z["X_seq"] if "X_seq" in z.files else None,
+            X_lag=z["X_lag"] if "X_lag" in z.files else None,
+            X_multi=z["X_multi"] if "X_multi" in z.files else None,
         )
 
     ds = build_dataset(bars, spec, include_lstm_seq=include_seq, sub_window=sub_window)
     ds.times, ds.target_end = _utc_index(ds.times), _utc_index(ds.target_end)
     path.parent.mkdir(parents=True, exist_ok=True)
-    extra = {"X_seq": ds.X_seq} if ds.X_seq is not None else {}
+    extra = {k: v for k, v in (("X_seq", ds.X_seq), ("X_lag", ds.X_lag), ("X_multi", ds.X_multi)) if v is not None}
     np.savez_compressed(
         path, times=to_ns(ds.times), target_end=to_ns(ds.target_end), y=ds.y, X_har=ds.X_har,
         X_stats=ds.X_stats, X_sig=ds.X_sig, y_har_log=ds.y_har_log,

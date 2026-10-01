@@ -19,7 +19,8 @@ from models_and_metrics import diebold_mariano
 
 HORIZON_ORDER = list(HORIZON_LABELS.values())
 KEY_MODELS = [
-    "HAR-RV-L", "GARCH(1,1)", "Ridge | stats", "Ridge | signature",
+    "HAR-RV-L", "GARCH(1,1) | rolling refit", "Ridge | stats", "Ridge | signature",
+    "Ridge | lag bank (matched)", "Ridge | multiscale stats",
     "XGBoost | signature", "MLP | stats+signature", "Signature LSTM",
     "HAR-RV-L + flag", "Ridge | signature + flag",
 ]
@@ -269,3 +270,55 @@ def plot_flag_timeline(res: Results):
         ax.set(title=f"{h}  (flagged {100 * f.flag.mean():.0f}% of out-of-sample rows)", ylabel="Volatility")
         ax.legend(loc="upper right", fontsize=8)
     return fig
+
+
+# ---------------------------------------------------------------- fairness checks
+
+CONTROLS = ["Ridge | lag bank (matched)", "Ridge | multiscale stats", "Ridge | stats"]
+
+
+def control_table(res: Results) -> pd.DataFrame:
+    """Is the signature gain specific to signatures? Ridge on signatures against the
+    same Ridge on signature-free feature sets: a lag bank with exactly as many
+    columns as the signature, a hand-built multi-scale volatility set, and the plain
+    summary stats. ``Pct_sig_better`` > 0 means signatures have the lower RMSE;
+    DM_stat < 0 (small DM_p) means signatures are significantly better."""
+    rows = []
+    for hk, meta in res.meta.items():
+        label = HORIZON_LABELS[hk]
+        p = res.predictions[res.predictions.Horizon == label]
+        pred = p.pivot(index="Time", columns="Model", values="Prediction").sort_index()
+        actual = p.drop_duplicates("Time").set_index("Time")["Actual"].sort_index().loc[pred.index]
+        err = pred.rsub(actual, axis=0)
+        if "Ridge | signature" not in err:
+            continue
+        rm = lambda e: float(np.sqrt((e**2).mean()))
+        for ctrl in CONTROLS:
+            if ctrl not in err:
+                continue
+            dm, pv = diebold_mariano(err["Ridge | signature"].to_numpy(), err[ctrl].to_numpy(), meta["horizon_rows"])
+            rows.append({
+                "Horizon": label, "Control": ctrl, "RMSE_signature": rm(err["Ridge | signature"]),
+                "RMSE_control": rm(err[ctrl]),
+                "Pct_sig_better": 100 * (1 - rm(err["Ridge | signature"]) / rm(err[ctrl])),
+                "DM_stat": dm, "DM_p": pv,
+            })
+    return pd.DataFrame(rows)
+
+
+def bias_table(res: Results, models=None) -> pd.DataFrame:
+    """Mean forecast / mean realized volatility per fold (1.0 = unbiased). A model
+    whose forecasts sit far above 1 in some folds is reverting to the wrong level,
+    which is how a stale long-run variance would show up in GARCH."""
+    p = res.predictions
+    if models is not None:
+        p = p[p.Model.isin(models)]
+    g = p.groupby(["Horizon", "Model", "Fold"]).agg(pred=("Prediction", "mean"), actual=("Actual", "mean")).reset_index()
+    g["Bias"] = g.pred / g.actual
+    t = g.pivot_table(index=["Horizon", "Model"], columns="Fold", values="Bias")
+    t.columns = [f"Fold {c}" for c in t.columns]
+    pooled = p.groupby(["Horizon", "Model"]).agg(pred=("Prediction", "mean"), actual=("Actual", "mean"))
+    t["Pooled"] = pooled.pred / pooled.actual
+    t = t.reset_index()
+    t["Horizon"] = pd.Categorical(t["Horizon"], HORIZON_ORDER, ordered=True)
+    return t.sort_values(["Horizon", "Model"]).reset_index(drop=True)
