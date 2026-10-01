@@ -303,6 +303,11 @@ def control_table(res: Results) -> pd.DataFrame:
                 "Pct_sig_better": 100 * (1 - rm(err["Ridge | signature"]) / rm(err[ctrl])),
                 "DM_stat": dm, "DM_p": pv,
             })
+    if not rows:
+        raise ValueError(
+            "No control-model results found. This run predates the controls; re-run with the current "
+            "code into a fresh output_dir (or delete the horizon folders in the old one)."
+        )
     return pd.DataFrame(rows)
 
 
