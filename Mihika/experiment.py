@@ -36,6 +36,7 @@ from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from anomaly_flag import episodes, fit_flag, to_ns
 from forecast_data import (
     SPECS,
     ForecastDataset,
@@ -102,6 +103,16 @@ class ExperimentConfig:
     run_ablations: bool = True
     ablation_models: tuple = ("Ridge | signature",)
 
+    # HMM anomaly flag (see anomaly_flag.py), added as an input to the forecasts
+    use_flag: bool = True
+    flag_states: int = 3  # the flag marks the highest-volatility state
+    flag_features: tuple = ("ret", "log_range", "rel_volume", "flow_imbalance", "trailing_vol")
+    flag_threshold: float = 0.5  # flag = filtered P(stress state) >= threshold
+    flag_restarts: int = 3
+    flag_freq: dict = field(  # cadence of the HMM's observations
+        default_factory=lambda: {"5m": "15min", "1h": "1h", "1d": "1D", "7d": "1D", "30d": "1D"}
+    )
+
     # io
     data_dir: str = "data"
     cache_dir: str = "cache"
@@ -125,7 +136,7 @@ class ExperimentConfig:
     @classmethod
     def from_json(cls, path: str | Path) -> "ExperimentConfig":
         d = json.loads(Path(path).read_text())
-        for k in ("horizons", "models", "ablation_models"):
+        for k in ("horizons", "models", "ablation_models", "flag_features"):
             if d.get(k) is not None:
                 d[k] = tuple(d[k])
         return cls(**d)
@@ -208,6 +219,50 @@ class FoldContext:
     horizon_steps: int
     cfg: ExperimentConfig
     returns: pd.Series | None = None
+    bars: pd.DataFrame | None = None  # needed by the flag models
+    spec: ForecastSpec | None = None
+    flag_cache: dict = field(default_factory=dict)  # shared across the models of a fold
+
+    # ---- HMM flag, fit once per fold on data before the test block
+    def flag_fit(self):
+        key = ("fit", self.fold.number)
+        if key not in self.flag_cache:
+            c = self.cfg
+            self.flag_cache[key] = fit_flag(
+                self.bars, c.flag_freq[self.horizon_key], self.ds.times[self.fold.test[0]],
+                n_states=c.flag_states, features=c.flag_features, threshold=c.flag_threshold,
+                restarts=c.flag_restarts, seed=c.seed,
+            )
+        return self.flag_cache[key]
+
+    def flag_probs(self) -> np.ndarray:
+        """Stress probability for every row, from state bars complete at its known time."""
+        return self.flag_fit().at(self.ds.times + pd.Timedelta(self.spec.bar_freq))
+
+    def flag_cols(self) -> np.ndarray:
+        """[flag, p_stress] for every row; columns constant in the training rows are dropped."""
+        p = self.flag_probs()
+        cols = np.column_stack([self.flag_fit().flag(p), p])
+        keep = cols[self.fold.train].std(axis=0) > 1e-9
+        return cols[:, keep]
+
+    def stress_dataset(self) -> ForecastDataset:
+        """Signature features with the stress probability added as a path dimension."""
+        key = ("stress", self.fold.number)
+        if key not in self.flag_cache:
+            c, fit = self.cfg, self.flag_fit()
+            bars = self.bars.assign(stress_prob=fit.at(self.bars.index + pd.Timedelta(self.spec.bar_freq)))
+            spec = replace(self.spec, dims=tuple(self.spec.dims) + ("stress",))
+            extra = "|".join(map(str, [
+                self.ds.times[self.fold.test[0]], c.flag_states, c.flag_features, c.flag_freq[self.horizon_key],
+                c.flag_restarts, c.seed,
+            ]))
+            ds = get_dataset(bars, spec, c, include_seq=False,
+                             sub_window=c.lstm_sub_window[self.horizon_key], extra=extra)
+            if not (ds.times == self.ds.times).all():
+                raise RuntimeError("Stress-dimension rows differ from the base dataset.")
+            self.flag_cache[key] = ds
+        return self.flag_cache[key]
 
     @property
     def y_train(self):
@@ -238,6 +293,7 @@ class ModelSpec:
     fit_predict: Callable[[FoldContext], np.ndarray]
     horizons: tuple | None = None  # None -> every horizon
     needs_seq: bool = False
+    needs_flag: bool = False  # uses the HMM anomaly flag
 
 
 def _mean(c):
@@ -300,6 +356,29 @@ def _lstm(c):
     return model.predict(Xte)
 
 
+def _har_flag(c):
+    d, tr, te = c.ds, c.fold.train, c.fold.test
+    X = np.hstack([d.X_har, c.flag_cols()])
+    return evaluate_har_log(X[tr], d.y_har_log[tr], X[te], c.y_test, c.horizon_steps).predictions
+
+
+def _ridge_flag(c):
+    d, tr, te = c.ds, c.fold.train, c.fold.test
+    X = np.hstack([d.X_sig, c.flag_cols()])
+    return fit_ridge(X[tr], c.y_train, d.times[tr], d.target_end[tr]).predict(X[te])
+
+
+def _xgb_flag(c):
+    X = np.hstack([c.ds.X_sig, c.flag_cols()])
+    model = fit_xgb(X[c.fold.train], c.y_train, random_state=c.cfg.seed, n_estimators=c.cfg.xgb_estimators)
+    return model.predict(X[c.fold.test])
+
+
+def _ridge_stress_dim(c):
+    d2, tr, te = c.stress_dataset(), c.fold.train, c.fold.test
+    return fit_ridge(d2.X_sig[tr], c.y_train, d2.times[tr], d2.target_end[tr]).predict(d2.X_sig[te])
+
+
 MODELS: dict[str, ModelSpec] = {
     m.name: m
     for m in [
@@ -314,6 +393,11 @@ MODELS: dict[str, ModelSpec] = {
         ModelSpec("MLP | stats", _mlp("stats")),
         ModelSpec("MLP | stats+signature", _mlp("stats+sig")),
         ModelSpec("Signature LSTM", _lstm, needs_seq=True),
+        # with the HMM anomaly flag: as columns, or as an extra signature path dimension
+        ModelSpec("HAR-RV-L + flag", _har_flag, needs_flag=True),
+        ModelSpec("Ridge | signature + flag", _ridge_flag, needs_flag=True),
+        ModelSpec("XGBoost | signature + flag", _xgb_flag, needs_flag=True),
+        ModelSpec("Ridge | signature + stress dim", _ridge_stress_dim, needs_flag=True),
     ]
 }
 
@@ -334,16 +418,22 @@ def evaluate_models(
     experiment: str = "Main",
     setting: str = "Main spec",
     keep_predictions: bool = True,
+    bars: pd.DataFrame | None = None,
+    spec: ForecastSpec | None = None,
+    flag_cache: dict | None = None,
 ):
     rows, preds = [], []
+    flag_cache = {} if flag_cache is None else flag_cache
     for fold in folds:
-        ctx = FoldContext(ds, fold, horizon_key, horizon_steps, cfg, returns)
+        ctx = FoldContext(ds, fold, horizon_key, horizon_steps, cfg, returns, bars, spec, flag_cache)
         for name in model_names:
-            spec = MODELS[name]
-            if spec.horizons is not None and horizon_key not in spec.horizons:
+            model = MODELS[name]
+            if model.horizons is not None and horizon_key not in model.horizons:
+                continue
+            if model.needs_flag and (not cfg.use_flag or bars is None):
                 continue
             t0 = time.time()
-            pred = np.maximum(np.asarray(spec.fit_predict(ctx), dtype=float), EPS)
+            pred = np.maximum(np.asarray(model.fit_predict(ctx), dtype=float), EPS)
             rows.append(
                 {
                     "HorizonKey": horizon_key, "Horizon": HORIZON_LABELS[horizon_key],
@@ -414,13 +504,14 @@ def _utc_index(values) -> pd.DatetimeIndex:
 
 
 def get_dataset(
-    bars: pd.DataFrame, spec: ForecastSpec, cfg: ExperimentConfig, *, include_seq: bool, sub_window: str
+    bars: pd.DataFrame, spec: ForecastSpec, cfg: ExperimentConfig, *, include_seq: bool, sub_window: str,
+    extra: str = "",
 ) -> ForecastDataset:
     """Build features once and cache to disk, keyed by spec + data fingerprint."""
     fingerprint = {
         "v": FEATURE_VERSION, "spec": asdict(spec), "seq": include_seq, "sub": sub_window,
         "n": len(bars), "first": str(bars.index[0]), "last": str(bars.index[-1]),
-        "close_sum": round(float(bars["close"].sum()), 6),
+        "close_sum": round(float(bars["close"].sum()), 6), "extra": extra,
     }
     key = hashlib.md5(json.dumps(fingerprint, sort_keys=True, default=str).encode()).hexdigest()[:16]
     path = Path(cfg.cache_dir) / f"{spec.name}_{key}.npz"
@@ -439,7 +530,7 @@ def get_dataset(
     path.parent.mkdir(parents=True, exist_ok=True)
     extra = {"X_seq": ds.X_seq} if ds.X_seq is not None else {}
     np.savez_compressed(
-        path, times=ds.times.asi8, target_end=ds.target_end.asi8, y=ds.y, X_har=ds.X_har,
+        path, times=to_ns(ds.times), target_end=to_ns(ds.target_end), y=ds.y, X_har=ds.X_har,
         X_stats=ds.X_stats, X_sig=ds.X_sig, y_har_log=ds.y_har_log,
         har_names=np.asarray(ds.har_names, dtype=str), stat_names=np.asarray(ds.stat_names, dtype=str),
         **extra,
@@ -513,6 +604,31 @@ def run_ablations(bars, base_spec, base_ds, folds, horizon_key, horizon_steps, c
 # --------------------------------------------------------------------------
 
 
+def flag_outputs(ds, folds, horizon_key, horizon_steps, cfg, bars, spec, flag_cache):
+    """Out-of-sample flag per test row, plus per-fold diagnostics of the flag itself."""
+    rows, diag = [], []
+    for fold in folds:
+        ctx = FoldContext(ds, fold, horizon_key, horizon_steps, cfg, None, bars, spec, flag_cache)
+        fit, p = ctx.flag_fit(), ctx.flag_probs()
+        flag = fit.flag(p)
+        te, tr = fold.test, fold.train
+        n_ep, mean_len = episodes(flag[te])
+        rows.append(pd.DataFrame({
+            "HorizonKey": horizon_key, "Horizon": HORIZON_LABELS[horizon_key], "Fold": fold.number,
+            "Time": ds.times[te], "p_stress": p[te], "flag": flag[te],
+        }))
+        y = ds.y[te]
+        diag.append({
+            "HorizonKey": horizon_key, "Horizon": HORIZON_LABELS[horizon_key], "Fold": fold.number,
+            "HMM_train_obs": fit.n_train_obs, "Share_flagged_train": float(flag[tr].mean()),
+            "Share_flagged_test": float(flag[te].mean()), "Episodes_test": n_ep,
+            "Mean_episode_rows": mean_len,
+            "Mean_vol_flagged": float(y[flag[te] == 1].mean()) if flag[te].sum() else np.nan,
+            "Mean_vol_unflagged": float(y[flag[te] == 0].mean()) if (flag[te] == 0).any() else np.nan,
+        })
+    return pd.concat(rows, ignore_index=True), pd.DataFrame(diag)
+
+
 def run_horizon(horizon: str, cfg: ExperimentConfig) -> Path:
     out = Path(cfg.output_dir) / horizon
     if cfg.resume and (out / "meta.json").exists():
@@ -524,7 +640,9 @@ def run_horizon(horizon: str, cfg: ExperimentConfig) -> Path:
     bars = load_bars(horizon, cfg)
     spec = base_spec_for(horizon, bars, cfg)
     horizon_steps = duration_steps(spec.horizon, spec.bar_freq)
-    names = list(cfg.models) if cfg.models else list(MODELS)
+    names = list(cfg.models) if cfg.models else [
+        n for n, m in MODELS.items() if cfg.use_flag or not m.needs_flag
+    ]
     need_seq = any(MODELS[n].needs_seq for n in names)
 
     ds = get_dataset(bars, spec, cfg, include_seq=need_seq, sub_window=cfg.lstm_sub_window[horizon])
@@ -535,9 +653,17 @@ def run_horizon(horizon: str, cfg: ExperimentConfig) -> Path:
         [(len(f.train), len(f.test)) for f in folds],
     )
 
-    metrics, preds = evaluate_models(ds, folds, horizon, horizon_steps, cfg, names, returns=returns)
+    flag_cache: dict = {}
+    metrics, preds = evaluate_models(
+        ds, folds, horizon, horizon_steps, cfg, names, returns=returns,
+        bars=bars, spec=spec, flag_cache=flag_cache,
+    )
     metrics.to_csv(out / "metrics.csv", index=False)
     preds.to_parquet(out / "predictions.parquet", index=False)
+    if cfg.use_flag:
+        flags, flag_diag = flag_outputs(ds, folds, horizon, horizon_steps, cfg, bars, spec, flag_cache)
+        flags.to_parquet(out / "flags.parquet", index=False)
+        flag_diag.to_csv(out / "flag_diagnostics.csv", index=False)
 
     if cfg.run_ablations:
         ablations = run_ablations(bars, spec, ds, folds, horizon, horizon_steps, cfg, returns)

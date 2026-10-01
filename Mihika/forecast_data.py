@@ -546,6 +546,11 @@ def make_base_path(window: pd.DataFrame, dims: Iterable[str]) -> np.ndarray:
         hl = np.log(window["high"].to_numpy() / window["low"].to_numpy())
         coordinates.append(np.cumsum(hl))
 
+    if "stress" in dims:
+        if "stress_prob" not in window.columns:
+            raise ValueError("'stress' dimension requires a stress_prob column (see anomaly_flag.py).")
+        coordinates.append(window["stress_prob"].to_numpy(float))
+
     if not coordinates:
         raise ValueError("No valid path dimensions were requested.")
     return np.column_stack(coordinates)

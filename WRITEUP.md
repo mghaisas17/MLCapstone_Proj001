@@ -36,14 +36,17 @@ Work so far splits into three threads:
 
 | Source | What it gives | Used for |
 |---|---|---|
-| Yahoo Finance (`yfinance`) BTC-USD | Daily OHLCV from 2014-09 to 2026-09, 4,369 rows | Macro-horizon detection (B); daily/weekly/monthly vol forecasting (C) |
+| Yahoo Finance (`yfinance`) BTC-USD | Daily OHLCV from 2014-09 to 2026-09 (4,369 rows; the volatility study uses 2015-01 onward) | Macro-horizon detection (B); daily/weekly/monthly vol forecasting (C) |
 | Binance public archive (`data.binance.vision`) | Trade-by-trade ticks and 1-min klines, no API key | Intraday and micro horizons (B); 5-min/1-hour anomaly and vol work (C) |
 
 Why this mix: Yahoo never exposes trade-level data. It only stores pre-built
 bars (daily back to ~2014, hourly ~2 years, 1-minute ~7 days). So it gives the
 multi-year history needed to cover all the labeled events. Binance gives real
 tick data, but a day of BTCUSDT trades is roughly 900k rows. Tick pulls are
-therefore short windows only. In Aayush's pipeline the 2023-10-01 to 2023-10-05
+therefore short windows only. The volatility study (C) streams each Binance
+day into 5-second and 1-minute bars and keeps only those (2026-07-01 to
+2026-09-15), because loading raw ticks for that range crashed the notebook
+kernel. In Aayush's pipeline the 2023-10-01 to 2023-10-05
 tick reference alone was ~98.8M trades.
 
 Dukascopy (via the TheoryCraft library) and CoinDesk were also researched as
@@ -271,114 +274,197 @@ signature residual correction (R² 0.294, slightly *worse* than HAR alone). This
 was the first signal that classical HAR is hard to beat at short horizons, and it
 led to the dedicated forecasting study below.
 
-### 5.2 Volatility forecasting across five horizons (`volatility_forecasting.ipynb`, `forecast_data.py`, `models_and_metrics.py`)
+### 5.2 Volatility forecasting experiment (`volatility_experiments.ipynb`, `experiment.py`, `reporting.py`)
 
 **Motivation.** Anomaly labels are arbitrary, but future realized volatility is
-an objective target. This gives a cleaner test of whether signature features
-carry predictive information, against standard econometric baselines.
+an objective target. It gives a cleaner test of whether signature features carry
+predictive information, against standard econometric baselines.
+
+**History.** The first version used two notebooks with different folds, caps and
+settings. Its walk-forward folds were not purged, and the path dimensions were
+chosen on the same holdout the comparison was scored on. Both notebooks were
+replaced by one runner. Everything below comes from the run in the committed
+notebook (`results/main`). Its numbers supersede the earlier ones.
 
 **Design.**
-- Horizons: 5 min and 1 hour (Binance ticks/bars, Aug 2026); 1, 7 and 30 days
-  (Yahoo, 2020–2026).
-- Target: realized variance over the forecast horizon (Garman-Klass for daily
-  bars).
-- Paths: price, activity (volume), and signed flow (Binance) or high-low range
-  (Yahoo, which has no signed flow). Lead-lag and time augmentation. Depth 3
-  (399 signature features in the compact run).
-- Baselines: HAR-RV-L (log-variance HAR with a leverage term, per-horizon direct
-  regression), GARCH(1,1), XGBoost on stats, MLP on stats.
-- Signature models: Ridge, XGBoost, MLP (stats + signature), and an LSTM over a
-  sequence of sub-window signatures.
-- Evaluation: chronological splits; walk-forward expanding-window backtest for
-  the full comparison. Diebold–Mariano tests against the best model.
-- The earlier "Random Forest on stats" baseline was replaced by XGBoost on stats,
-  so the stats-vs-signature comparison changes only the features, not the model
-  family.
-- Depth 4 is commented out because it crashes on the machine.
+- **Data.** Yahoo BTC-USD daily bars from 2015-01 to 2026-09 for the 1/7/30-day
+  horizons, with no cap and no stride. Binance BTCUSDT from 2026-07-01 to
+  2026-09-15 (77 days) for 5 min and 1 hour, streamed one day at a time into
+  5-second and 1-minute bars. The intraday horizons use a sampling stride so each
+  has about 4,000 forecast rows.
+- **Target.** Realized volatility over the next horizon (Garman-Klass variance
+  for daily bars, close-to-close for intraday).
+- **CV.** Three expanding-window walk-forward folds on four consecutive blocks.
+  Block 0 is train-only. Any training row whose label window reaches the first
+  test time is purged. Every model sees identical folds, and Ridge's alpha is
+  chosen by an inner purged CV.
+- **Signature specification, fixed in advance.** Depth 3, lead-lag plus time
+  augmentation, full path: price, activity, and signed flow (Binance) or high-low
+  range (Yahoo). That is 399 signature features. The ablations below did not
+  choose it.
+- **Models.** Mean, HAR-RV-L, GARCH(1,1), and Ridge, XGBoost and MLP on summary
+  stats, on signatures, or on both, plus a signature LSTM. Ridge's alpha is tuned.
+  XGBoost (500 trees, depth 3), the MLP (128-64-16, 200 epochs) and the LSTM use
+  fixed hyperparameters.
+- **Tests.** Diebold–Mariano on pooled out-of-sample errors, with the lag set to
+  the horizon length in forecast rows.
 
-**Experiment 1, baseline comparison (RMSE; lower is better).**
+| Horizon | Rows | Independent targets (approx.) | Fold test periods |
+|---|---|---|---|
+| 5 min | 3,992 | ~3,990 (non-overlapping), but all from 77 days | Jul 20–Aug 8, Aug 8–27, Aug 27–Sep 15, 2026 |
+| 1 hour | 3,907 | ~1,300 | same |
+| 1 day | 4,262 | ~4,260 | Dec 2017–Nov 2020, Nov 2020–Oct 2023, Oct 2023–Sep 2026 |
+| 7 day | 4,256 | ~600 | same |
+| 30 day | 4,233 | ~140 | same |
 
-| Horizon | HAR-RV-L | XGB (stats) | Sig. Ridge | XGB (sig.) | Winner |
+The daily folds cover very different eras. Fold 1 contains the 2018 bear market
+and the 2020 COVID crash. Fold 2 contains the 2021 run-up, the 2022 crashes,
+the FTX collapse and the 2023 banking crisis. Fold 3 is the recent, lower-volatility period.
+
+### 5.3 Results
+
+**Model ranking** (fold-mean RMSE; lower is better; `%HAR` is the RMSE
+improvement over HAR-RV-L). `p` is the pooled Diebold–Mariano p-value against HAR-RV-L.
+
+| Horizon | Best models | RMSE (%HAR, p) | HAR-RV-L | Mean | Worst |
 |---|---|---|---|---|---|
-| 5 min | 6.12e-4 | **4.19e-4** | 4.67e-4 | 4.25e-4 | XGB stats, XGB sig. a close second |
-| 1 hour | **1.31e-3** | 1.66e-3 | 1.90e-3 | 1.51e-3 | HAR |
-| 1 day | 1.06e-2 | 1.24e-2 | **9.56e-3** | 1.01e-2 | Sig. Ridge |
-| 7 day | 2.24e-2 | 3.99e-2 | **1.92e-2** | 2.36e-2 | Sig. Ridge |
-| 30 day | 4.80e-2 | 7.95e-2 | **3.99e-2** | 4.57e-2 | Sig. Ridge |
+| 5 min | Ridge stats+sig / Ridge stats / Ridge sig | 4.11e-4 (+12.3%, 0.004) / 4.25e-4 (+9.2%, 0.025) / 4.43e-4 (+5.5%, 0.20) | 4.68e-4 | 6.13e-4 | Sig. LSTM 7.19e-4 (−54%) |
+| 1 hour | **HAR-RV-L** | 1.49e-3 | best | 2.06e-3 | Ridge sig 1.83e-3 (−22%, p<1e-10) |
+| 1 day | Ridge stats+sig / Ridge sig / XGB sig | 1.500e-2 (+8.5%, 5e-4) / 1.502e-2 (+8.4%, 8e-4) / 1.519e-2 (+7.3%, 0.002) | 1.639e-2 | 1.862e-2 | MLP stats 2.31e-2 |
+| 7 day | Ridge sig / Ridge stats+sig | 3.06e-2 (+12.6%, 2e-6) / 3.11e-2 (+11.4%, 5e-4) | 3.51e-2 | 3.95e-2 | XGB stats 4.89e-2 (−40%) |
+| 30 day | Ridge stats+sig / Ridge sig | 5.65e-2 (+13.0%, 0.011) / 5.67e-2 (+12.7%, 0.025) | 6.50e-2 | 6.88e-2 | XGB stats 1.06e-1 (−63%) |
 
-**Experiment 5, full walk-forward model comparison (1/7/30 day).**
-Signature Ridge ranks first at every horizon. The Diebold–Mariano p-value is the
-test against it.
+- **Daily and longer.** Ridge on signatures (alone or with stats) is the best or
+  second-best model at 1, 7 and 30 days. Ridge on stats alone is statistically
+  indistinguishable from HAR (p = 0.66 at 1 day, 0.74 at 7 days, 0.97 at 30 days).
+  At 5 min, Ridge on stats+signatures is nominally best, but the difference
+  from Ridge on stats alone is not significant (p = 0.54).
+- **1 hour.** HAR-RV-L is best and significantly better than every other model.
+- **Nonlinear models.** XGBoost, MLP and LSTM beat HAR only sporadically and
+  never significantly at 7 or 30 days. XGBoost and MLP on stats alone are far worse
+  than the mean forecast at 7 and 30 days.
+- **GARCH(1,1).** Worse than the mean forecast at 7 days (−3%) and 30 days (−35%),
+  and only 2.6% better than the mean at 1 day.
+- **At 30 days HAR itself is barely better than predicting the mean** (5.7% lower RMSE; p = 0.40).
 
-| Horizon | Sig. Ridge RMSE | HAR-RV-L (p) | Sig. LSTM (p) | GARCH(1,1) (p) | XGB sig. (p) |
+**Fold stability.** Ridge on signatures beats the mean forecast in all three
+folds at every horizon. HAR-RV-L is worse than the mean in fold 3 at 30 days,
+and GARCH is worse than the mean in most folds. The LSTM is unstable: in fold 1
+its RMSE is 2.5× the mean forecast at 5 min and 1.5× at 1 hour.
+
+**Signature-construction ablations** (Ridge on signatures, same folds; % change
+in RMSE against each control; positive is better). These are descriptive. They
+did not select the main specification.
+
+| | 5 min | 1 hour | 1 day | 7 day | 30 day |
 |---|---|---|---|---|---|
-| 1 day | 0.01298 | 0.01384 (3e-5) | 0.01749 (3e-8) | 0.01734 (≈0) | 0.01712 (1e-10) |
-| 7 day | 0.02450 | 0.02943 (2e-10) | 0.03338 (9e-6) | 0.03782 (≈0) | 0.03956 (1e-6) |
-| 30 day | 0.05203 | 0.05825 (0.025) | 0.06016 (0.041) | 0.09063 (≈0) | 0.06927 (8e-4) |
+| Levels 1–2 vs level 1 | +11.5 | +7.8 | +7.8 | +8.0 | +6.0 |
+| Levels 1–3 vs level 1 | +28.9 | +11.6 | +12.1 | +14.7 | +8.8 |
+| Lead-lag + time vs raw path | +9.3 | +5.4 | +9.4 | +7.5 | +0.3 |
+| Time only vs raw path | −0.6 | +2.8 | +4.8 | +6.7 | −0.4 |
+| Price + activity vs price only | +11.4 | +17.1 | +4.0 | +14.6 | −1.5 |
+| Full path vs price only | +11.2 | +17.2 | +12.7 | +26.8 | +10.1 |
 
-The two stats-only models (XGBoost and MLP on stats) are the worst at all three horizons. The HAR
-advantage for signatures is about 6% at 1 day, 17% at 7 days, and 11% at 30
-days. That is significant at the 5% level at every horizon, though only weakly
-at 30 days (p≈0.025 against HAR, p≈0.04 against the LSTM).
+**Calm vs stressed periods.** Terciles of realized volatility in the
+out-of-sample target. Relative to HAR, Ridge on signatures does much better in
+the low and middle terciles at 1, 7 and 30 days (roughly +30–45%), but is worse
+than HAR in the highest-volatility tercile (roughly −5% to −20%). The nonlinear
+models lose heavily in the lowest tercile at 5 min and 1 hour.
 
-**Experiment 3, augmentation ablation.** Lead-lag + time was best for XGBoost at
-5 min, 1 hour and 7 days, and for Ridge at 5 min, 1 hour and 1 day. Time-only was
-best for Ridge at 7 and 30 days (by under 1% at 7 days). No augmentation was best
-for XGBoost at 30 days, where lead-lag + time was the worst setting. Overall
-effects are small and horizon-dependent.
+### 5.4 What the evidence supports
 
-**Experiment 4, path dimensions.** Adding activity helped slightly at 5 min
-(best overall RMSE 4.16e-4, price + activity with XGBoost) but did not
-consistently help elsewhere. Price-only was best for 30-day XGBoost (0.0396
-vs 0.0457 for the full path). The flow
-(imbalance) channel never improved on price + activity. Daily range gave a
-small gain for Ridge at 1 and 7 days. For Experiment 5 the notebook picks, per
-horizon, the dimension setting with the lowest Experiment 4 RMSE.
+**Reasonably supported.**
+1. **At daily to weekly horizons a regularized linear model on depth-3
+   signatures forecasts volatility better than HAR-RV-L.**
+   - The gain is 8% at 1 day and 12.6% at 7 days, with p-values of 1e-3 to 1e-6.
+   - It holds in all three folds, which cover different eras of BTC.
+   - The 1-day test has about 4,260 targets and the 7-day test about 600.
+   - It survives purging, which removed the concern that the earlier result came
+     from label overlap. The first, unpurged run gave a similar direction, but
+     many things changed at once, so the two cannot be compared cleanly.
+2. **Signatures do not help at 1 hour**, and beat HAR at 5 min only when combined
+   with summary stats, where they add nothing demonstrable over stats alone.
+3. **The main spec was fixed in advance**, so the headline numbers were not
+   picked from the ablations.
+4. **Using only the price path throws away most of the benefit.** In the
+   dimension ablation, price-only is the worst at every horizon. Activity and
+   range or flow channels carry much of the gain.
 
-**Experiment 2, depth 3 vs 4.** Not run, because depth 4 crashes. Depth 3 rests
-on the synthetic test in §3 only.
+**Suggestive, but not established.**
+- **30 days.** There are only about 140 independent targets, the p-values are
+  0.011–0.025, and HAR is barely better than the mean. With about 50
+  model-and-horizon comparisons against HAR, a single p of 0.02 is not strong
+  evidence. A 10% gain with this much noise could well shrink on new data.
+- **5 min.** Ridge on signatures alone is not significantly better than HAR
+  (p = 0.20), and the data cover only 77 days of one market regime.
 
-### 5.3 Revised, more conservative evaluation (`volatility_forecasting_visuals.ipynb`)
+**Why the signature result should not be over-read.**
+- **No dimension-matched control.** Ridge on 399 signature features is being
+  compared with HAR (4 features) and Ridge on 11 summary stats. We have not
+  compared it with a non-signature feature bank of the same size, for example
+  lagged squared returns, ranges and volumes at many lags. Without that control we cannot say
+  signatures help because of path geometry, as opposed to being a rich
+  multi-scale realized-volatility feature set. Depth also matters: more levels
+  helped monotonically up to the deepest tested level (3), so we do not know
+  where the gain saturates.
+- **Unequal tuning.** Ridge's alpha is tuned by CV. XGBoost, the MLP and the
+  LSTM use fixed, untuned hyperparameters. "Linear beats nonlinear" is partly a
+  tuning-effort result, not a conclusion that nonlinear models cannot help.
+- **GARCH is probably handicapped.** It uses parameters fit once on the training
+  period and held fixed. In a market whose volatility fell over time, long
+  horizon forecasts revert to a long-run variance estimated from earlier, more
+  volatile years. That would explain its large overshoot at 30 days. This is a
+  hypothesis and has not been checked. We should not conclude that signatures
+  beat GARCH in general.
+- **One asset, one history, three folds.** The folds are consecutive blocks of
+  one time series, not independent draws. Consistency across three eras is
+  reassuring, but it says nothing about other assets.
+- **RMSE is dominated by crisis periods**, so pooled results lean on fold 1
+  (2018–2020) and its large errors. The loss differential is not stationary
+  across folds, which weakens the Diebold–Mariano p-values. A robust loss such as QLIKE
+  was dropped earlier and should be restored.
+- **Stress periods.** The calm-vs-stressed picture is conditioned on the
+  realized outcome, so models that smooth forecasts look good in calm periods and
+  poor in spikes by construction. Even so, signature Ridge does not beat HAR when
+  volatility is highest, which is where forecasts matter most for risk. This
+  motivates the anomaly flag below.
+- **Short intraday window.** 5 min and 1 hour come from 77 days of one regime,
+  so those results are the weakest in the study.
 
-**Motivation.** The first notebook picked per-horizon dimension settings and then
-reported results on the same data. The second notebook is built to be harder to
-fool:
-- two **purged** expanding-window folds, dropping any training row whose target
-  reaches into the validation block;
-- a no-information **Mean** baseline in every comparison;
-- data volume capped at 1,200 observations per horizon (laptop memory);
-- configuration diagnostics run with Ridge only, so a representation change is
-  not confused with a model change;
-- the main model table fixed before the diagnostics are examined.
+**What would strengthen the conclusions.**
+(a) A dimension-matched non-signature control, run through the same folds.
+(b) Depth 4, and tuning for XGBoost, MLP and LSTM.
+(c) The same experiment on a second asset such as ETH, and a longer Binance history.
+(d) QLIKE or MAE alongside RMSE, and per-fold Diebold–Mariano tests.
+(e) A GARCH that is refit as the window expands.
 
-It adds heatmaps of % improvement over the mean forecast, fold-stability plots,
-actual-vs-predicted timelines, cumulative squared-error advantage over HAR,
-RMSE by realized-vol regime, and a configuration-driver heatmap (signature
-level, augmentation, dimensions). **The numeric outputs were not saved to the
-repo** (it writes to `outputs_small/`, which is not committed), and the figures
-are not stored, so there are no results to report here. The notebook's own
-text says two folds on a capped dataset are for "directional analysis" and that
-its conclusions should be confirmed on more data before being treated as final.
+### 5.5 HMM anomaly flag as a forecasting input (implemented, not yet run on real data)
 
-### 5.4 Takeaways for Thread C
+**Idea.** A Gaussian HMM, fit on as many features as we like, outputs a
+"stress or not" flag. The flag then becomes an extra input to the volatility
+forecasts, to see whether regime information improves them, in particular in the
+high-volatility periods where signature Ridge underperforms HAR.
 
-1. At daily-to-monthly horizons, a ridge regression on depth-3 signatures gives
-   a consistent, statistically significant RMSE reduction over HAR-RV-L, GARCH
-   and the other learners. This is the project's clearest positive result for
-   signatures.
-2. At 5 min and 1 hour the benefit disappears. Signatures roughly tie XGBoost on
-   summary stats at 5 min and lose to HAR at 1 hour.
-3. A simple, heavily regularized linear model on signatures beats the flexible
-   models (XGBoost, MLP, LSTM) on the same features. With limited observations
-   per horizon (about 1,000 in the compact run) against hundreds of signature
-   features, heavy regularization is plausible as the reason, though this was not
-   tested.
-4. Augmentation and dimension choices produce small, inconsistent differences.
-   They are not a reliable source of gains.
-5. Caveats on the evidence: the Experiment 1–5 numbers use a chronological split
-   or a walk-forward backtest on one asset and one period. The path-dimension
-   choice was made on the same data it was scored on. The revised notebook
-   (§5.3) exists to address this, but its results are not saved.
+**Implementation** (`anomaly_flag.py`, wired into `experiment.py`):
+- A 3-state diagonal-Gaussian HMM, with the highest-volatility state treated as
+  "stress". Features: return, log range, relative volume, signed-flow imbalance
+  (Binance only) and trailing volatility.
+- Only **filtered** (forward) probabilities are used, never smoothed ones. The
+  HMM and its scaler are refit in each fold on observations that ended before the
+  test block, and a row only sees state bars completed by its timestamp.
+- Four new models, each paired with an otherwise identical model: HAR-RV-L + flag,
+  Ridge signature + flag, XGBoost signature + flag (flag and stress probability as
+  columns), and Ridge signature with the stress probability as an additional
+  signature **path dimension**.
+- Diagnostics: how often the flag is on per fold, episode lengths, and whether
+  volatility is higher while it is on. The results can be compared with and
+  without the flag, split by flagged and unflagged rows.
+- Status: verified for wiring on synthetic data only. No results yet.
+  Horizons already in `results/main` are skipped on re-run, so use a new
+  `output_dir` (or delete the horizon folders) to include the flag models.
+- Caveat: rows in a fold's training set are flagged by an HMM fit on data that
+  includes them, whereas test rows are flagged out of sample. This is a mild
+  mismatch but a real one.
 
 ## 6. Cross-cutting issues and limitations
 
@@ -391,7 +477,12 @@ its conclusions should be confirmed on more data before being treated as final.
 - **Calibration.** FPRs of 6–22% against a 1% target show the thresholds are not
   yet trustworthy. Longer or less-overlapping calibration sets would help.
 - **Compute and environment.** Pure-NumPy signatures and a hand-rolled HMM on
-  one machine; depth-4 crashes on another. These limit depth and scale.
+  one machine; depth 4 was never run in the volatility study (it crashed in the
+  first version). These limit depth and scale.
+- **Volatility study (Thread C).** No dimension-matched non-signature control;
+  only Ridge is tuned; one asset and three folds; the 5-min and 1-hour results
+  rest on 77 days; RMSE only, so crisis periods dominate; GARCH uses fixed
+  parameters. See §5.4.
 - **Unfinished.** Micro and intraday horizons are not evaluated. The summary
   table has no rows for them. CVaR-OCSVM does not work on real data. P&L
   evaluation (in the task plan) has not been started. The anomaly threads (B and C)
@@ -407,5 +498,6 @@ its conclusions should be confirmed on more data before being treated as final.
 | Do they flag real historical events? | 4/5, with lags of 1–21 days and 6% FPR in the best configuration; the 2023 banking crisis is missed |
 | Do they beat simple baselines at detection? | Not shown. An HMM is faster and engineered-feature one-class SVM is competitive, both at much higher FPR |
 | Do signatures predict abnormal 5-min windows better than summary stats? | No, with a small single-week sample |
-| Do signatures improve volatility forecasts? | Yes at 1/7/30 days (Ridge, significant vs HAR/GARCH); no at 5 min / 1 hour |
+| Do signatures improve volatility forecasts? | At 1 and 7 days, yes: Ridge on signatures is 8% and 12.6% better than HAR in RMSE (p ≤ 1e-3), consistent across three eras. At 30 days it is ~13% better but only weakly significant (p ≈ 0.01–0.03). At 5 min only combined with stats, and not beyond stats alone. At 1 hour HAR wins. Whether signature *geometry* is the reason is untested (no matched control). |
+| Does an HMM anomaly flag help volatility forecasts? | Implemented and tested for wiring on synthetic data; not yet run on real data |
 | Paper's CVaR-OCSVM on market data? | Does not work as implemented |

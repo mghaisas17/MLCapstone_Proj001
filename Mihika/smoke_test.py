@@ -41,6 +41,7 @@ except ImportError:  # pure-NumPy stand-in so the pipeline can run where it will
     shim.siglength = lambda d, m: sum(d**k for k in range(1, m + 1))
     sys.modules["iisignature"] = shim
 
+import anomaly_flag as af
 import experiment as ex
 import forecast_data as fd
 import reporting as rp
@@ -115,6 +116,30 @@ def test_purge():
     ok("purged folds never train on a label that reaches the test block")
 
 
+# ---------------------------------------------------------------- HMM
+def test_hmm():
+    T = 4000
+    state = np.zeros(T, int)
+    for t in range(1, T):
+        state[t] = state[t - 1] if rng.random() < 0.97 else 1 - state[t - 1]
+    sd = np.where(state == 1, 3.0, 0.7)[:, None]
+    X = rng.normal(0, 1, (T, 3)) * sd
+    hmm = af.DiagGaussianHMM(2, seed=0).fit(X[:2500], restarts=3)
+    stress = int(np.argmax(hmm.vars_.sum(1)))
+    p = hmm.filter(X)[:, stress]
+    acc = ((p[2500:] > 0.5) == (state[2500:] == 1)).mean()
+    assert acc > 0.9, acc
+    assert np.allclose(hmm.filter(X[:1500]), hmm.filter(X)[:1500]), "filter must be causal"
+    ok(f"HMM recovers a 2-regime process out of sample (acc={acc:.2f}); filtered probs are causal")
+
+
+def test_to_ns():
+    i = pd.date_range("2024-01-01", periods=3, freq="D", tz="UTC")
+    a = af.to_ns(i)
+    assert a.dtype == np.dtype("datetime64[ns]") and (pd.DatetimeIndex(a).tz_localize("UTC") == i).all()
+    ok("datetime handling is independent of pandas resolution")
+
+
 # ---------------------------------------------------------------- synthetic bars
 def synth_bars(n, freq, binance):
     idx = pd.date_range("2024-01-01", periods=n, freq=freq, tz="UTC")
@@ -159,12 +184,25 @@ def test_pipeline(tmp):
     for m in ex.MODELS:
         assert m in set(res.metrics.Model), m
     assert {"Signature level", "Augmentation", "Dimensions"} <= set(res.ablations.Experiment)
+    flag_models = {n for n, m in ex.MODELS.items() if m.needs_flag}
+    assert flag_models <= set(res.metrics.Model), flag_models - set(res.metrics.Model)
+    assert not res.flags.empty and not res.flag_diag.empty
+    assert set(res.flags.flag.unique()) <= {0.0, 1.0}
+    assert res.flags.p_stress.between(0, 1).all()
+    assert len(res.flags) == len(res.predictions[res.predictions.Model == "Mean"])
     ok("all horizons x folds x models ran; GARCH daily-only; ablations present")
 
     # cache: second build must come from disk
     n_cached = len(list(Path(cfg.cache_dir).glob("*.npz")))
     assert n_cached >= 5
     ok(f"feature cache written ({n_cached} files)")
+    bars = ex.load_bars("1d", cfg)
+    spec = ex.base_spec_for("1d", bars, cfg)
+    again = ex.get_dataset(bars, spec, cfg, include_seq=True, sub_window=cfg.lstm_sub_window["1d"])
+    again2 = ex.get_dataset(bars, spec, cfg, include_seq=True, sub_window=cfg.lstm_sub_window["1d"])
+    assert (again.times == again2.times).all() and again.times.tz is not None
+    assert again.times[0] >= bars.index[0] and again.times[-1] <= bars.index[-1], "cached times corrupted"
+    ok("cached features reload with correct timestamps")
 
     # resume: nothing is recomputed
     before = (root / "1d" / "meta.json").stat().st_mtime
@@ -179,19 +217,27 @@ def test_pipeline(tmp):
         assert t.Best.sum() == 1 and len(t) >= 9
     ok("summary + Diebold-Mariano tables")
 
+    eff = rp.flag_effect_table(res)
+    assert len(eff) == 4 * len(ex.HORIZON_LABELS) and np.isfinite(eff.RMSE_base_all).all()
+    diag = rp.flag_diagnostics_table(res)
+    assert (diag.Share_flagged_test.between(0, 1)).all()
+    ok("flag models, out-of-sample flags, diagnostics and flag-effect table")
+
     import matplotlib.pyplot as plt
-    for fn in (rp.plot_relative_heatmap, rp.plot_fold_stability, rp.plot_predictions,
+    for fn in (rp.plot_flag_timeline, rp.plot_relative_heatmap, rp.plot_fold_stability, rp.plot_predictions,
                rp.plot_cumulative_advantage, rp.plot_regimes, rp.plot_ablations):
         fig = fn(res)
         fig.savefig(tmp / f"{fn.__name__}.png", dpi=40)
         plt.close(fig)
-    ok("all six figures render")
+    ok("all figures render")
 
 
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         test_purge()
+        test_hmm()
+        test_to_ns()
         test_loader(tmp)
         test_pipeline(tmp)
     print("\nALL SMOKE CHECKS PASSED")

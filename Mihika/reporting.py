@@ -6,7 +6,7 @@ model -- so plots can be regenerated without re-running the experiments.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -21,6 +21,14 @@ HORIZON_ORDER = list(HORIZON_LABELS.values())
 KEY_MODELS = [
     "HAR-RV-L", "GARCH(1,1)", "Ridge | stats", "Ridge | signature",
     "XGBoost | signature", "MLP | stats+signature", "Signature LSTM",
+    "HAR-RV-L + flag", "Ridge | signature + flag",
+]
+# (without the HMM flag, with it): what the flag adds to an otherwise identical model
+FLAG_PAIRS = [
+    ("HAR-RV-L", "HAR-RV-L + flag"),
+    ("Ridge | signature", "Ridge | signature + flag"),
+    ("Ridge | signature", "Ridge | signature + stress dim"),
+    ("XGBoost | signature", "XGBoost | signature + flag"),
 ]
 
 
@@ -30,21 +38,26 @@ class Results:
     predictions: pd.DataFrame
     ablations: pd.DataFrame
     meta: dict  # horizon key -> meta.json contents
+    flags: pd.DataFrame = field(default_factory=pd.DataFrame)  # out-of-sample flag per test row
+    flag_diag: pd.DataFrame = field(default_factory=pd.DataFrame)  # per-fold flag diagnostics
 
 
 def load_results(output_dir: str | Path) -> Results:
     root = Path(output_dir)
-    metrics, preds, abl, meta = [], [], [], {}
+    metrics, preds, abl, meta, flags, fdiag = [], [], [], {}, [], []
     for d in sorted(p for p in root.iterdir() if (p / "meta.json").exists()):
         meta[d.name] = json.loads((d / "meta.json").read_text())
         metrics.append(pd.read_csv(d / "metrics.csv"))
         preds.append(pd.read_parquet(d / "predictions.parquet"))
         if (d / "ablations.csv").exists():
             abl.append(pd.read_csv(d / "ablations.csv"))
+        if (d / "flags.parquet").exists():
+            flags.append(pd.read_parquet(d / "flags.parquet"))
+            fdiag.append(pd.read_csv(d / "flag_diagnostics.csv"))
     if not metrics:
         raise FileNotFoundError(f"No completed horizons found under {root}")
     cat = lambda xs: pd.concat(xs, ignore_index=True) if xs else pd.DataFrame()
-    return Results(cat(metrics), cat(preds), cat(abl), meta)
+    return Results(cat(metrics), cat(preds), cat(abl), meta, cat(flags), cat(fdiag))
 
 
 def _horizons(df: pd.DataFrame) -> list[str]:
@@ -193,4 +206,66 @@ def plot_ablations(res: Results):
         mat = z.pivot(index="Horizon", columns="Setting", values="Improvement").reindex(_horizons(diag))
         sns.heatmap(mat, annot=True, fmt=".1f", center=0, cmap="RdYlGn", cbar=False, ax=ax)
         ax.set(title=f"{exp} (% vs {control})", xlabel="", ylabel="")
+    return fig
+
+
+# ---------------------------------------------------------------- anomaly flag
+
+
+def flag_diagnostics_table(res: Results) -> pd.DataFrame:
+    """How the flag behaves per fold: how often it is on, how long episodes last,
+    and whether volatility is actually higher while it is on."""
+    if res.flag_diag.empty:
+        raise ValueError("No flag results; run with use_flag=True")
+    d = res.flag_diag.copy()
+    d["Vol_ratio_flagged_vs_not"] = d["Mean_vol_flagged"] / d["Mean_vol_unflagged"]
+    d["Horizon"] = pd.Categorical(d["Horizon"], HORIZON_ORDER, ordered=True)
+    return d.sort_values(["Horizon", "Fold"]).drop(columns="HorizonKey").reset_index(drop=True)
+
+
+def flag_effect_table(res: Results) -> pd.DataFrame:
+    """For each (model, model + flag) pair: pooled out-of-sample RMSE overall and
+    split by flagged / unflagged rows, with a Diebold-Mariano test of the flag
+    version against the original. Positive Pct_* means the flag lowered the error."""
+    if res.flags.empty:
+        raise ValueError("No flag results; run with use_flag=True")
+    rows = []
+    for hk, meta in res.meta.items():
+        label = HORIZON_LABELS[hk]
+        p = res.predictions[res.predictions.Horizon == label]
+        pred = p.pivot(index="Time", columns="Model", values="Prediction").sort_index()
+        actual = p.drop_duplicates("Time").set_index("Time")["Actual"].sort_index().loc[pred.index]
+        err = pred.rsub(actual, axis=0)
+        flag = res.flags[res.flags.Horizon == label].set_index("Time")["flag"].reindex(pred.index).fillna(0).to_numpy() == 1
+        rmse = lambda e, m: float(np.sqrt((e[m] ** 2).mean())) if m.any() else np.nan
+        everything = np.ones(len(err), bool)
+        for base, new in FLAG_PAIRS:
+            if base not in err or new not in err:
+                continue
+            row = {"Horizon": label, "Base": base, "With_flag": new, "N_flagged": int(flag.sum()), "N": len(err)}
+            for tag, mask in (("all", everything), ("flagged", flag), ("unflagged", ~flag)):
+                b, n = rmse(err[base], mask), rmse(err[new], mask)
+                row[f"RMSE_base_{tag}"], row[f"RMSE_flag_{tag}"] = b, n
+                row[f"Pct_{tag}"] = 100 * (1 - n / b) if b else np.nan
+            row["DM_stat"], row["DM_p"] = diebold_mariano(err[new].to_numpy(), err[base].to_numpy(), meta["horizon_rows"])
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def plot_flag_timeline(res: Results):
+    """Realized volatility through the out-of-sample period, flagged stretches shaded."""
+    if res.flags.empty:
+        raise ValueError("No flag results; run with use_flag=True")
+    hz = _horizons(res.flags)
+    fig, axes = plt.subplots(len(hz), 1, figsize=(14, 2.6 * len(hz)), constrained_layout=True, squeeze=False)
+    for ax, h in zip(axes[:, 0], hz):
+        f = res.flags[res.flags.Horizon == h].sort_values("Time")
+        a = res.predictions[res.predictions.Horizon == h].drop_duplicates("Time").sort_values("Time")
+        t = pd.to_datetime(a.Time)
+        ax.plot(t, a.Actual, color="black", lw=1.0, label="Realized volatility")
+        ft = pd.to_datetime(f.Time)
+        ax.fill_between(ft, 0, float(a.Actual.max()), where=(f.flag.to_numpy() == 1), step="mid",
+                        color="#C8553D", alpha=0.3, label="Anomaly flag", linewidth=0)
+        ax.set(title=f"{h}  (flagged {100 * f.flag.mean():.0f}% of out-of-sample rows)", ylabel="Volatility")
+        ax.legend(loc="upper right", fontsize=8)
     return fig
