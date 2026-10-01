@@ -849,3 +849,154 @@ def load_forecast_dataset(path: str | Path) -> ForecastDataset:
         stat_names=data["stat_names"].tolist(),
         y_har_log=data["y_har_log"],
     )
+
+
+# --------------------------------------------------------------------------
+# Memory-safe Binance loader
+#
+# A single BTCUSDT day is ~1M+ trades, so a few months of raw ticks does not
+# fit in memory (this is what kept crashing the notebook kernel). Instead each
+# day's zip is streamed to disk, read in chunks, and reduced straight to bar
+# files for every requested frequency. Raw trades are never concatenated or
+# written out; only the small per-day bar files are kept, and a day that is
+# already cached is never downloaded again.
+# --------------------------------------------------------------------------
+
+_BAR_AGG = {
+    "open": "first",
+    "high": "max",
+    "low": "min",
+    "close": "last",
+    "volume": "sum",
+    "dollar_volume": "sum",
+    "signed_dollar_flow": "sum",
+}
+
+
+def _chunk_to_partial_bars(chunk: pd.DataFrame, freq: str) -> pd.DataFrame:
+    ts = _parse_binance_timestamp(chunk["timestamp"])
+    price = pd.to_numeric(chunk["price"], errors="coerce")
+    qty = pd.to_numeric(chunk["qty"], errors="coerce")
+    dollars = pd.to_numeric(chunk["quote_qty"], errors="coerce")
+    sign = np.where(chunk["is_buyer_maker"].astype(bool), -1.0, 1.0)
+    df = pd.DataFrame(
+        {"price": price, "qty": qty, "dollar_volume": dollars, "flow": sign * dollars}
+    )
+    df.index = ts
+    df = df.loc[df.index.notna() & df["price"].notna() & df["qty"].notna()]
+    g = df.groupby(df.index.floor(freq))
+    return pd.DataFrame(
+        {
+            "open": g["price"].first(),
+            "high": g["price"].max(),
+            "low": g["price"].min(),
+            "close": g["price"].last(),
+            "volume": g["qty"].sum(),
+            "dollar_volume": g["dollar_volume"].sum(),
+            "signed_dollar_flow": g["flow"].sum(),
+        }
+    )
+
+
+def _binance_day_to_bars(
+    symbol: str, day: date, freqs: Iterable[str], chunksize: int, timeout: int = 120
+) -> dict[str, pd.DataFrame]:
+    """Download one day's trade zip to a temp file and reduce it to bars."""
+    import tempfile
+
+    date_str = day.strftime("%Y-%m-%d")
+    url = (
+        "https://data.binance.vision/data/spot/daily/trades/"
+        f"{symbol}/{symbol}-trades-{date_str}.zip"
+    )
+    freqs = list(freqs)
+    partials: dict[str, list[pd.DataFrame]] = {f: [] for f in freqs}
+    with tempfile.TemporaryFile() as tmp:
+        with requests.get(url, timeout=timeout, stream=True) as response:
+            if response.status_code != 200:
+                raise FileNotFoundError(
+                    f"Binance file unavailable for {symbol} on {date_str} "
+                    f"(HTTP {response.status_code})"
+                )
+            for block in response.iter_content(chunk_size=1 << 20):
+                tmp.write(block)
+        tmp.seek(0)
+        with zipfile.ZipFile(tmp) as zf:
+            with zf.open(zf.namelist()[0]) as handle:
+                reader = pd.read_csv(
+                    handle,
+                    header=None,
+                    names=BINANCE_COLUMNS,
+                    usecols=["price", "qty", "quote_qty", "timestamp", "is_buyer_maker"],
+                    chunksize=chunksize,
+                )
+                for chunk in reader:
+                    for f in freqs:
+                        partials[f].append(_chunk_to_partial_bars(chunk, f))
+    out = {}
+    for f in freqs:
+        # chunks are time-ordered, so first/last across chunk boundaries are correct
+        out[f] = pd.concat(partials[f]).groupby(level=0).agg(_BAR_AGG)
+    return out
+
+
+def _fill_bar_gaps(bars: pd.DataFrame, freq: str) -> pd.DataFrame:
+    """Regular grid; empty buckets carry the last close with zero volume."""
+    bars = bars.sort_index()
+    bars = bars.loc[~bars.index.duplicated(keep="last")]
+    bars = bars.reindex(pd.date_range(bars.index[0], bars.index[-1], freq=freq))
+    bars["close"] = bars["close"].ffill()
+    for col in ("open", "high", "low"):
+        bars[col] = bars[col].fillna(bars["close"])
+    for col in ("volume", "dollar_volume", "signed_dollar_flow"):
+        bars[col] = bars[col].fillna(0.0)
+    bars.index.name = "timestamp"
+    return bars.dropna(subset=["close"])
+
+
+def fetch_binance_bars(
+    start: str | date,
+    end: str | date,
+    freqs: Iterable[str] = ("5s", "1min"),
+    symbol: str = "BTCUSDT",
+    data_dir: str | Path = "data/bars",
+    force_download: bool = False,
+    skip_unavailable: bool = True,
+    chunksize: int = 500_000,
+) -> dict[str, pd.DataFrame]:
+    """Bars for an inclusive date range at each frequency, built one day at a
+    time with bounded memory. Returns {freq: DataFrame}."""
+    data_dir = _ensure_data_dir(data_dir)
+    freqs = list(freqs)
+    dates = _inclusive_dates(start, end)
+    per_freq: dict[str, list[pd.DataFrame]] = {f: [] for f in freqs}
+
+    for k, day in enumerate(dates, start=1):
+        day_str = day.strftime("%Y-%m-%d")
+        paths = {f: data_dir / f"{symbol}_{f}_{day_str}.parquet" for f in freqs}
+        if not force_download and all(p.exists() for p in paths.values()):
+            try:
+                cached = {f: pd.read_parquet(p) for f, p in paths.items()}
+            except Exception:
+                # a truncated cache file (e.g. after a disk-full error): rebuild
+                for p in paths.values():
+                    p.unlink(missing_ok=True)
+            else:
+                for f, b in cached.items():
+                    per_freq[f].append(b)
+                continue
+        try:
+            LOGGER.info("[%d/%d] Downloading %s %s", k, len(dates), symbol, day_str)
+            day_bars = _binance_day_to_bars(symbol, day, freqs, chunksize)
+        except FileNotFoundError as exc:
+            if skip_unavailable:
+                LOGGER.warning("[%d/%d] %s", k, len(dates), exc)
+                continue
+            raise
+        for f, b in day_bars.items():
+            b.to_parquet(paths[f])
+            per_freq[f].append(b)
+
+    if not per_freq[freqs[0]]:
+        raise ValueError("No Binance data could be loaded for the requested date range.")
+    return {f: _fill_bar_gaps(pd.concat(parts), f) for f, parts in per_freq.items()}

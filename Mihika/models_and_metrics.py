@@ -164,11 +164,12 @@ def fit_xgb(
     *,
     random_state: int = 42,
     n_jobs: int = 1,
+    n_estimators: int = 500,
 ) -> XGBRegressor:
     LOGGER.info("Fitting XGBoost")
     model = XGBRegressor(
         objective="reg:squarederror",
-        n_estimators=500,
+        n_estimators=n_estimators,
         max_depth=3,
         learning_rate=0.03,
         subsample=0.8,
