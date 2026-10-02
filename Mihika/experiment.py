@@ -111,6 +111,11 @@ class ExperimentConfig:
     garch_window: int = 1000
     garch_refit_every: int = 30
 
+    # Per-horizon overrides of the main signature spec, e.g. {"1d": {"depth": 2, "lead_lag": False}}.
+    # Any ForecastSpec field except sample_stride (use target_rows) can be set; the default
+    # spec is depth 3, lead-lag + time augmentation, and the horizon's full path dimensions.
+    spec_overrides: dict = field(default_factory=dict)
+
     # ablations (signature level / augmentation / dimensions), same folds
     run_ablations: bool = True
     ablation_models: tuple = ("Ridge | signature",)
@@ -536,6 +541,19 @@ def choose_stride(n_bars: int, spec: ForecastSpec, target_rows: int | None) -> i
 
 def base_spec_for(horizon: str, bars: pd.DataFrame, cfg: ExperimentConfig) -> ForecastSpec:
     spec = replace(SPECS[horizon], depth=3, lead_lag=True, time_aug=True)
+    overrides = dict(cfg.spec_overrides.get(horizon, {}))
+    unknown = set(overrides) - {f for f in ForecastSpec.__dataclass_fields__ if f not in ("name", "sample_stride")}
+    if unknown:
+        raise ValueError(f"Unknown or unsupported spec override(s) for {horizon}: {sorted(unknown)}")
+    for k in ("dims", "har_windows"):  # JSON round trips turn tuples into lists
+        if k in overrides:
+            overrides[k] = tuple(overrides[k])
+    if "stress" in overrides.get("dims", ()):
+        raise ValueError(
+            "'stress' cannot be set in spec_overrides: the stress probability comes from an HMM refit "
+            "in every fold, so it is only added by the 'Ridge | signature + stress dim' model."
+        )
+    spec = replace(spec, **overrides)
     return replace(spec, sample_stride=choose_stride(len(bars), spec, cfg.target_rows.get(horizon)))
 
 

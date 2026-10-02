@@ -327,3 +327,67 @@ def bias_table(res: Results, models=None) -> pd.DataFrame:
     t = t.reset_index()
     t["Horizon"] = pd.Categorical(t["Horizon"], HORIZON_ORDER, ordered=True)
     return t.sort_values(["Horizon", "Model"]).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------- comparing runs
+
+
+def compare_runs(runs: dict, model: str = "Ridge | signature", folds=None, metric: str = "Pct_vs_HAR") -> pd.DataFrame:
+    """One row per run, one column per horizon, for a single model: use it to compare
+    signature settings that were each run into their own output directory.
+
+    ``folds`` restricts the comparison to some folds (e.g. choose a setting on folds
+    (1, 2) and confirm on fold (3,)); picking the best of many settings on the same
+    folds you then report is optimistic. ``metric`` is a column of ``summary_table``:
+    Pct_vs_HAR / Pct_vs_Mean (positive = better) or Mean_RMSE (lower = better)."""
+    from dataclasses import replace as _replace
+
+    out = {}
+    for name, path in runs.items():
+        res = load_results(path)
+        if folds is not None:
+            res = _replace(res, metrics=res.metrics[res.metrics.Fold.isin(list(folds))])
+        s = summary_table(res)
+        s = s[s.Model == model]
+        out[name] = s.set_index("Horizon")[metric]
+    table = pd.DataFrame(out).T
+    return table[[h for h in HORIZON_ORDER if h in table.columns]]
+
+
+def flag_accuracy_table(res: Results, quantile: float = 0.8) -> pd.DataFrame:
+    """How often does the flag fire when it should? "Should" is defined as the realized
+    volatility over the forecast horizon landing in the top ``1 - quantile`` of that fold's
+    out-of-sample rows, so this measures the flag as a warning of high upcoming volatility.
+
+    Precision = P(high | flagged); Recall = P(flagged | high); Lift = precision / base rate
+    (1.0 = no better than chance); False_alarm_rate = P(flagged | not high). AUC_flag ranks
+    rows by the stress probability; AUC_HAR ranks them by the HAR-RV-L forecast, a simple
+    benchmark the flag must beat to be adding something."""
+    from sklearn.metrics import roc_auc_score
+
+    if res.flags.empty:
+        raise ValueError("No flag results; run with use_flag=True")
+    rows = []
+    for hk in res.meta:
+        label = HORIZON_LABELS[hk]
+        f = res.flags[res.flags.Horizon == label]
+        har = res.predictions[(res.predictions.Horizon == label) & (res.predictions.Model == "HAR-RV-L")]
+        d = f.merge(har[["Time", "Fold", "Actual", "Prediction"]], on=["Time", "Fold"])
+        d["high"] = d.groupby("Fold")["Actual"].transform(lambda s: s >= s.quantile(quantile))
+        groups = [(str(k), g) for k, g in d.groupby("Fold")] + [("All", d)]
+        for fold, g in groups:
+            high, flag = g["high"].to_numpy(bool), g["flag"].to_numpy(bool)
+            two_classes = 0 < high.sum() < len(high)
+            prec = high[flag].mean() if flag.any() else np.nan
+            rows.append({
+                "Horizon": label, "Fold": fold, "N": len(g), "Base_rate": high.mean(),
+                "Share_flagged": flag.mean(), "Precision": prec,
+                "Recall": flag[high].mean() if high.any() else np.nan,
+                "Lift": prec / high.mean() if flag.any() and high.any() else np.nan,
+                "False_alarm_rate": flag[~high].mean() if (~high).any() else np.nan,
+                "AUC_flag": roc_auc_score(high, g["p_stress"]) if two_classes else np.nan,
+                "AUC_HAR": roc_auc_score(high, g["Prediction"]) if two_classes else np.nan,
+            })
+    out = pd.DataFrame(rows)
+    out["Horizon"] = pd.Categorical(out["Horizon"], HORIZON_ORDER, ordered=True)
+    return out.sort_values(["Horizon", "Fold"]).reset_index(drop=True)

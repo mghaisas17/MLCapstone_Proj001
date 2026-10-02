@@ -181,6 +181,22 @@ def test_garch_rolling():
     ok(f"rolling GARCH runs (mean forecast / realized: rolling {b_roll:.2f} vs fixed {b_fix:.2f} on a series with a volatility-level drop)")
 
 
+def test_flag_accuracy():
+    n = 600
+    t = pd.date_range("2024", periods=n, freq="D", tz="UTC")
+    vol = np.exp(np.cumsum(rng.normal(0, 0.1, n)) * 0.3) * rng.lognormal(0, 0.3, n)
+    p = np.clip((vol - vol.min()) / np.ptp(vol), 0, 1)
+    fold = np.repeat([1, 2, 3], n // 3)
+    base = {"Horizon": "1 day", "HorizonKey": "1d", "Fold": fold, "Time": t}
+    preds = pd.DataFrame({**base, "Model": "HAR-RV-L", "Actual": vol, "Prediction": vol * rng.lognormal(0, 0.3, n)})
+    mk = lambda pp: rp.Results(pd.DataFrame(), preds, pd.DataFrame(), {"1d": {"horizon_rows": 1}},
+                               pd.DataFrame({**base, "p_stress": pp, "flag": (pp > 0.6).astype(float)}), pd.DataFrame())
+    good = rp.flag_accuracy_table(mk(p)).query("Fold == 'All'").iloc[0]
+    bad = rp.flag_accuracy_table(mk(rng.random(n))).query("Fold == 'All'").iloc[0]
+    assert good.AUC_flag > 0.8 and abs(bad.AUC_flag - 0.5) < 0.1 and good.Lift > 2
+    ok(f"flag accuracy table separates an informative flag (AUC {good.AUC_flag:.2f}) from a random one ({bad.AUC_flag:.2f})")
+
+
 # ---------------------------------------------------------------- synthetic bars
 def synth_bars(n, freq, binance):
     idx = pd.date_range("2024-01-01", periods=n, freq=freq, tz="UTC")
@@ -198,6 +214,12 @@ def synth_bars(n, freq, binance):
         df["signed_dollar_flow"] = rng.normal(0, 1, n) * df["dollar_volume"] * 0.2
     df.index.name = "timestamp"
     return df
+
+
+def _dump(cfg, tmp):
+    p = tmp / "variant_config.json"
+    cfg.to_json(p)
+    return p
 
 
 def test_pipeline(tmp):
@@ -259,6 +281,32 @@ def test_pipeline(tmp):
         assert t.Best.sum() == 1 and len(t) >= 9
     ok("summary + Diebold-Mariano tables")
 
+    # a signature variant through the same pipeline, then compared against the main run
+    from dataclasses import replace as _r
+    variant = _r(
+        cfg, horizons=("1d",), spec_overrides={"1d": {"depth": 2, "dims": ["price", "activity"]}},
+        models=("Mean", "HAR-RV-L", "Ridge | signature"), run_ablations=False, use_flag=False,
+        output_dir=str(tmp / "results_variant"),
+    )
+    ex.run_all(_r(variant, spec_overrides=ex.ExperimentConfig.from_json(_dump(variant, tmp)).spec_overrides))
+    vres = rp.load_results(variant.output_dir)
+    assert set(vres.metrics.Model) == {"Mean", "HAR-RV-L", "Ridge | signature"}
+    cmp_all = rp.compare_runs({"main": root, "depth2": variant.output_dir}, folds=None)
+    cmp_f12 = rp.compare_runs({"main": root, "depth2": variant.output_dir}, folds=(1, 2))
+    assert "1 day" in cmp_all.columns and set(cmp_all.index) == {"main", "depth2"}
+    assert np.isfinite(cmp_f12.loc["depth2", "1 day"])
+    n_main = ex.get_dataset(ex.load_bars("1d", cfg), ex.base_spec_for("1d", ex.load_bars("1d", cfg), cfg), cfg,
+                            include_seq=False, sub_window="5D").X_sig.shape[1]
+    n_var = ex.get_dataset(ex.load_bars("1d", variant), ex.base_spec_for("1d", ex.load_bars("1d", variant), variant),
+                           variant, include_seq=False, sub_window="5D").X_sig.shape[1]
+    assert n_var < n_main, (n_var, n_main)
+    try:
+        ex.base_spec_for("1d", ex.load_bars("1d", cfg), _r(cfg, spec_overrides={"1d": {"bogus": 1}}))
+        raise AssertionError("unknown override accepted")
+    except ValueError:
+        pass
+    ok(f"spec_overrides: variant run + compare_runs ({n_main} -> {n_var} signature columns); bad keys rejected")
+
     ct = rp.control_table(res)
     assert set(ct.Control) == set(rp.CONTROLS) and np.isfinite(ct.RMSE_control).all()
     bt = rp.bias_table(res)
@@ -269,6 +317,9 @@ def test_pipeline(tmp):
     assert len(eff) == 4 * len(ex.HORIZON_LABELS) and np.isfinite(eff.RMSE_base_all).all()
     diag = rp.flag_diagnostics_table(res)
     assert (diag.Share_flagged_test.between(0, 1)).all()
+    acc = rp.flag_accuracy_table(res)
+    assert (acc.Fold == "All").sum() == len(ex.HORIZON_LABELS) and acc.Share_flagged.between(0, 1).all()
+    assert acc.Precision.dropna().between(0, 1).all() and acc.AUC_flag.dropna().between(0, 1).all()
     ok("flag models, out-of-sample flags, diagnostics and flag-effect table")
 
     import matplotlib.pyplot as plt
@@ -287,6 +338,7 @@ if __name__ == "__main__":
         test_hmm()
         test_to_ns()
         test_garch_rolling()
+        test_flag_accuracy()
         test_loader(tmp)
         test_controls_and_tuning()
         test_pipeline(tmp)
