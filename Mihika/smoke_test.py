@@ -197,6 +197,109 @@ def test_flag_accuracy():
     ok(f"flag accuracy table separates an informative flag (AUC {good.AUC_flag:.2f}) from a random one ({bad.AUC_flag:.2f})")
 
 
+# ---------------------------------------------------------------- intraday paths
+def hourly_and_daily(n_days=400):
+    h = synth_bars(24 * n_days, "1h", True)
+    d = h.resample("1D").agg({"open": "first", "high": "max", "low": "min", "close": "last",
+                              "volume": "sum", "dollar_volume": "sum"})
+    return h, d
+
+
+def test_klines(tmp):
+    t0 = pd.Timestamp("2025-03-01", tz="UTC")
+    minutes = pd.date_range(t0, periods=3 * 1440, freq="min")  # 3 days of 1-minute klines
+    price = 30_000 * np.exp(np.cumsum(rng.normal(0, 3e-4, len(minutes))))
+    qty, quote = rng.uniform(0.1, 3, len(minutes)), None
+    quote = price * qty
+    buy_q = quote * rng.uniform(0.2, 0.8, len(minutes))
+    df = pd.DataFrame({
+        "t": 0,
+        "o": price, "h": price * 1.001, "l": price * 0.999, "c": price, "v": qty, "ct": 0,
+        "q": quote, "n": 10, "tb": qty * 0.5, "tq": buy_q, "ig": 0,
+    })
+    df["t"] = (minutes - pd.Timestamp("1970-01-01", tz="UTC")) // pd.Timedelta(microseconds=1)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("k.csv", df.to_csv(index=False, header=False))
+    content = buf.getvalue()
+
+    class Resp:
+        def __init__(self, status): self.status_code = status
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def iter_content(self, chunk_size):
+            for i in range(0, len(content), 8192):
+                yield content[i:i + 8192]
+
+    calls = []
+    def fake_get(url, **kw):
+        calls.append(url)
+        return Resp(404 if "/monthly/" in url else 200)  # no monthly archive yet -> daily fallback
+
+    fd.requests.get = fake_get
+    out = fd.fetch_binance_klines_hourly("2025-03-01", "2025-03-01", data_dir=tmp / "klines")
+    assert any("/daily/" in u for u in calls) and any("/monthly/" in u for u in calls)
+    first = out.iloc[:24]
+    day = df.iloc[:1440]
+    assert np.isclose(first["dollar_volume"].sum(), day["q"].sum())
+    assert np.isclose(first["signed_dollar_flow"].sum(), (2 * day["tq"] - day["q"]).sum())
+    assert np.isclose(first["close"].iloc[0], day["c"].iloc[59]) and np.isclose(first["high"].iloc[0], day["h"].iloc[:60].max())
+    n = len(calls)
+    fd.fetch_binance_klines_hourly("2025-03-01", "2025-03-01", data_dir=tmp / "klines")
+    assert len([u for u in calls[n:] if "/daily/" in u]) == 0, "cached day downloaded again"
+    ok("klines -> hourly bars: dollar volume, signed taker flow, OHLC; monthly->daily fallback; cache")
+
+
+def test_intraday_no_lookahead():
+    hourly, daily = hourly_and_daily(300)
+    spec = ex.replace(fd.SPECS["1d_i"], intraday_path_points=24, sample_stride=7)
+    base = fd.build_dataset(daily, spec, intraday=hourly)
+    assert base.X_isig.shape == base.X_ilag.shape and base.X_isig.shape[0] == len(base.y)
+    # rows only exist once a full intraday window is available
+    assert base.times[0] >= hourly.index[0] + pd.Timedelta("30D") - pd.Timedelta("1D")
+    T = hourly.index[24 * 200]
+    tampered = hourly.copy()
+    cols = ["open", "high", "low", "close"]
+    tampered.loc[tampered.index > T, cols] = tampered.loc[tampered.index > T, cols] * 3.0  # change only the future
+    alt = fd.build_dataset(daily, spec, intraday=tampered)
+    known = base.times + pd.Timedelta("1D")
+    past = np.asarray(known <= T)
+    assert past.sum() > 5 and (~past).sum() > 5
+    for name in ("X_isig", "X_ilag", "X_imulti", "X_harrv"):
+        a, b = getattr(base, name), getattr(alt, name)
+        assert np.allclose(a[past], b[past]), f"{name} changed when only future intraday bars changed"
+    assert not np.allclose(base.X_isig[~past], alt.X_isig[~past])
+    ok("intraday windows use no bars after the row's known time (tampering with the future changes nothing earlier)")
+
+
+def test_intraday_pipeline(tmp):
+    hourly, daily = hourly_and_daily(400)
+    ex.load_or_download_yahoo = lambda *a, **k: daily
+    ex.fetch_binance_klines_hourly = lambda *a, **k: hourly
+    models = ("Mean", "HAR-RV-L", "Ridge | stats", "Ridge | signature", "GARCH(1,1) | rolling refit",
+              "Ridge | intraday signature", "Ridge | intraday lag bank (matched)", "Ridge | intraday multiscale stats",
+              "HAR-RV-L (intraday RV)", "Ridge | intraday signature + HAR-RV")
+    cfg = ex.ExperimentConfig(
+        horizons=("1d_i", "7d_i"), models=models, torch_epochs=2, xgb_estimators=10, target_rows={},
+        spec_overrides={k: {"intraday_path_points": 24} for k in ("1d_i", "7d_i")},
+        data_dir=str(tmp / "data"), cache_dir=str(tmp / "cache"), output_dir=str(tmp / "results_intraday"),
+    )
+    root = ex.run_all(cfg)
+    res = rp.load_results(root)
+    assert set(res.meta) == {"1d_i", "7d_i"} and all(m["intraday_paths"] for m in res.meta.values())
+    assert set(res.metrics.Model) == set(models), set(models) ^ set(res.metrics.Model)
+    assert res.flags.empty and res.ablations.empty
+    assert np.isfinite(res.metrics.RMSE).all()
+    # rows are the same for every model on a horizon (same target, same rows)
+    for hk in ("1d_i", "7d_i"):
+        p = res.predictions[res.predictions.HorizonKey == hk]
+        assert p.groupby("Model").Time.apply(lambda t: tuple(t)).nunique() == 1
+    tab = rp.intraday_table(res)
+    assert {"Versus", "Pct_better", "DM_p"} <= set(tab.columns) and np.isfinite(tab.Pct_better).all()
+    assert set(rp.summary_table(res).Horizon.astype(str)) == {"1 day (intraday paths)", "7 day (intraday paths)"}
+    ok("intraday-path horizons: same rows for every model, new models + controls run, comparison table")
+
+
 # ---------------------------------------------------------------- synthetic bars
 def synth_bars(n, freq, binance):
     idx = pd.date_range("2024-01-01", periods=n, freq=freq, tz="UTC")
@@ -231,22 +334,24 @@ def test_pipeline(tmp):
     ex.load_or_download_yahoo = lambda *a, **k: synth_bars(900, "1D", False)
 
     cfg = ex.ExperimentConfig(
-        target_rows={h: 300 for h in ex.HORIZON_LABELS},
+        target_rows={h: 300 for h in ex.MAIN_HORIZONS},
         torch_epochs=2, xgb_estimators=10,
         data_dir=str(tmp / "data"), cache_dir=str(tmp / "cache"), output_dir=str(tmp / "results"),
     )
     root = ex.run_all(cfg)
     res = rp.load_results(root)
 
-    assert set(res.meta) == set(ex.HORIZON_LABELS), res.meta.keys()
+    assert set(res.meta) == set(ex.MAIN_HORIZONS), res.meta.keys()
     assert res.metrics.Fold.nunique() == cfg.n_folds
     # GARCH only on daily horizons; every other model on every horizon
     for g in ("GARCH(1,1) | fixed", "GARCH(1,1) | rolling refit"):
         garch = set(res.metrics[res.metrics.Model == g].HorizonKey)
-        assert garch == set(ex.DAILY_HORIZONS), (g, garch)
+        assert garch == set(ex.DAILY_HORIZONS) & set(ex.MAIN_HORIZONS), (g, garch)
     assert np.isfinite(res.metrics.RMSE).all()
-    for m in ex.MODELS:
-        assert m in set(res.metrics.Model), m
+    for m, spec in ex.MODELS.items():
+        if not spec.needs_intraday:  # intraday-path models run only on the *_i horizons
+            assert m in set(res.metrics.Model), m
+    assert not any(ex.MODELS[m].needs_intraday for m in set(res.metrics.Model))
     assert {"Signature level", "Augmentation", "Dimensions"} <= set(res.ablations.Experiment)
     flag_models = {n for n, m in ex.MODELS.items() if m.needs_flag}
     assert flag_models <= set(res.metrics.Model), flag_models - set(res.metrics.Model)
@@ -276,7 +381,7 @@ def test_pipeline(tmp):
 
     summ = rp.summary_table(res)
     assert {"Mean_RMSE", "Pct_vs_HAR", "Rank"} <= set(summ.columns)
-    for hk in ex.HORIZON_LABELS:
+    for hk in ex.MAIN_HORIZONS:
         t = rp.dm_table(res, hk)
         assert t.Best.sum() == 1 and len(t) >= 9
     ok("summary + Diebold-Mariano tables")
@@ -314,11 +419,11 @@ def test_pipeline(tmp):
     ok("control table (signature vs signature-free) and bias table")
 
     eff = rp.flag_effect_table(res)
-    assert len(eff) == 4 * len(ex.HORIZON_LABELS) and np.isfinite(eff.RMSE_base_all).all()
+    assert len(eff) == 4 * len(ex.MAIN_HORIZONS) and np.isfinite(eff.RMSE_base_all).all()
     diag = rp.flag_diagnostics_table(res)
     assert (diag.Share_flagged_test.between(0, 1)).all()
     acc = rp.flag_accuracy_table(res)
-    assert (acc.Fold == "All").sum() == len(ex.HORIZON_LABELS) and acc.Share_flagged.between(0, 1).all()
+    assert (acc.Fold == "All").sum() == len(ex.MAIN_HORIZONS) and acc.Share_flagged.between(0, 1).all()
     assert acc.Precision.dropna().between(0, 1).all() and acc.AUC_flag.dropna().between(0, 1).all()
     ok("flag models, out-of-sample flags, diagnostics and flag-effect table")
 
@@ -340,6 +445,9 @@ if __name__ == "__main__":
         test_garch_rolling()
         test_flag_accuracy()
         test_loader(tmp)
+        test_klines(tmp)
+        test_intraday_no_lookahead()
         test_controls_and_tuning()
         test_pipeline(tmp)
+        test_intraday_pipeline(tmp)
     print("\nALL SMOKE CHECKS PASSED")

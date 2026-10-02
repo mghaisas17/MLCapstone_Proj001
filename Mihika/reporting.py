@@ -372,6 +372,8 @@ def flag_accuracy_table(res: Results, quantile: float = 0.8) -> pd.DataFrame:
         label = HORIZON_LABELS[hk]
         f = res.flags[res.flags.Horizon == label]
         har = res.predictions[(res.predictions.Horizon == label) & (res.predictions.Model == "HAR-RV-L")]
+        if f.empty:
+            continue  # horizons without a flag (the intraday-path variants)
         d = f.merge(har[["Time", "Fold", "Actual", "Prediction"]], on=["Time", "Fold"])
         d["high"] = d.groupby("Fold")["Actual"].transform(lambda s: s >= s.quantile(quantile))
         groups = [(str(k), g) for k, g in d.groupby("Fold")] + [("All", d)]
@@ -391,3 +393,56 @@ def flag_accuracy_table(res: Results, quantile: float = 0.8) -> pd.DataFrame:
     out = pd.DataFrame(rows)
     out["Horizon"] = pd.Categorical(out["Horizon"], HORIZON_ORDER, ordered=True)
     return out.sort_values(["Horizon", "Fold"]).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------- intraday paths for daily/weekly horizons
+
+INTRADAY_COMPARISONS = [
+    # (model, [what it is compared against])
+    ("Ridge | intraday signature", [
+        "Ridge | intraday lag bank (matched)", "Ridge | intraday multiscale stats", "HAR-RV-L (intraday RV)",
+        "Ridge | signature", "HAR-RV-L"]),
+    ("Ridge | intraday signature + HAR-RV", ["HAR-RV-L (intraday RV)"]),
+    ("HAR-RV-L (intraday RV)", ["HAR-RV-L"]),
+]
+
+
+def intraday_table(res: Results) -> pd.DataFrame:
+    """The questions the intraday-path horizons (``*_i``) exist to answer, on identical rows and targets:
+
+    * signature vs lag bank / multi-scale stats built from the same intraday window (is it the
+      signature, or just having the intraday path?);
+    * vs HAR-RV-L on intraday realized variance (the standard strong baseline) and vs the
+      daily-path signature (does the intraday path add anything?);
+    * signature + HAR-RV vs HAR-RV alone (does the signature add on top of the baseline?);
+    * intraday-RV HAR vs the daily-estimator HAR.
+
+    ``Pct_better`` > 0 means ``Model`` has the lower pooled RMSE; ``DM_stat`` < 0 with a small
+    ``DM_p`` means it is significantly better."""
+    rows = []
+    for hk, meta in res.meta.items():
+        if not meta.get("intraday_paths"):
+            continue
+        label = HORIZON_LABELS[hk]
+        p = res.predictions[res.predictions.Horizon == label]
+        pred = p.pivot(index="Time", columns="Model", values="Prediction").sort_index()
+        actual = p.drop_duplicates("Time").set_index("Time")["Actual"].sort_index().loc[pred.index]
+        err = pred.rsub(actual, axis=0)
+        rm = lambda e: float(np.sqrt((e**2).mean()))
+        for model, versus in INTRADAY_COMPARISONS:
+            if model not in err:
+                continue
+            for other in versus:
+                if other not in err:
+                    continue
+                dm, pv = diebold_mariano(err[model].to_numpy(), err[other].to_numpy(), meta["horizon_rows"])
+                rows.append({
+                    "Horizon": label, "Model": model, "Versus": other,
+                    "RMSE_model": rm(err[model]), "RMSE_versus": rm(err[other]),
+                    "Pct_better": 100 * (1 - rm(err[model]) / rm(err[other])), "DM_stat": dm, "DM_p": pv,
+                })
+    if not rows:
+        raise ValueError("No intraday-path results; run the *_i horizons (see the notebook section).")
+    out = pd.DataFrame(rows)
+    out["Horizon"] = pd.Categorical(out["Horizon"], HORIZON_ORDER, ordered=True)
+    return out.sort_values(["Horizon"]).reset_index(drop=True)

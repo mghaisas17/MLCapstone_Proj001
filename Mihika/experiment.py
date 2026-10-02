@@ -44,6 +44,7 @@ from forecast_data import (
     build_dataset,
     duration_steps,
     fetch_binance_bars,
+    fetch_binance_klines_hourly,
     load_or_download_yahoo,
 )
 from models_and_metrics import (
@@ -63,9 +64,24 @@ from models_and_metrics import (
 LOGGER = logging.getLogger(__name__)
 
 FEATURE_VERSION = 2  # bump to invalidate cached feature files
-HORIZON_LABELS = {"5m": "5 min", "1h": "1 hour", "1d": "1 day", "7d": "7 day", "30d": "30 day"}
+HORIZON_LABELS = {
+    "5m": "5 min", "1h": "1 hour", "1d": "1 day", "7d": "7 day", "30d": "30 day",
+    # same rows, target and baselines as the daily horizons, signature built from hourly paths
+    "1d_i": "1 day (intraday paths)", "7d_i": "7 day (intraday paths)", "30d_i": "30 day (intraday paths)",
+}
 BINANCE_HORIZONS = ("5m", "1h")
-DAILY_HORIZONS = ("1d", "7d", "30d")
+INTRADAY_PATH_HORIZONS = ("1d_i", "7d_i", "30d_i")
+DAILY_HORIZONS = ("1d", "7d", "30d") + INTRADAY_PATH_HORIZONS
+MAIN_HORIZONS = ("5m", "1h", "1d", "7d", "30d")
+
+
+def base_key(horizon: str) -> str:
+    return horizon[:-2] if horizon.endswith("_i") else horizon
+
+
+def per_horizon(table: dict, horizon: str):
+    """Look up a per-horizon setting; the intraday-path variants share their daily horizon's."""
+    return table[horizon] if horizon in table else table[base_key(horizon)]
 
 
 # --------------------------------------------------------------------------
@@ -75,7 +91,7 @@ DAILY_HORIZONS = ("1d", "7d", "30d")
 
 @dataclass
 class ExperimentConfig:
-    horizons: tuple = ("5m", "1h", "1d", "7d", "30d")
+    horizons: tuple = MAIN_HORIZONS
     n_folds: int = 3
     min_train_rows: int = 50
 
@@ -86,6 +102,9 @@ class ExperimentConfig:
     ticker: str = "BTC-USD"
     yahoo_start: str = "2015-01-01"
     yahoo_end: str | None = None  # None -> today
+    # Hourly bars (Binance 1-minute klines) for the *_i horizons: signatures from intraday paths
+    intraday_start: str = "2017-08-01"
+    intraday_end: str | None = None  # None -> same as yahoo_end / today
     # Target number of forecast rows per horizon; the sampling stride is chosen
     # to hit it (None = every bar). Purging handles the label overlap.
     target_rows: dict = field(
@@ -144,7 +163,8 @@ class ExperimentConfig:
             self,
             binance_start=str((end - pd.Timedelta(days=9)).date()),
             yahoo_start="2021-01-01",
-            target_rows={h: 800 for h in HORIZON_LABELS},
+            target_rows={h: 800 for h in MAIN_HORIZONS},
+            intraday_start="2022-01-01",
             torch_epochs=25,
             xgb_estimators=100,
             output_dir=self.output_dir + "_quick",
@@ -246,7 +266,7 @@ class FoldContext:
         if key not in self.flag_cache:
             c = self.cfg
             self.flag_cache[key] = fit_flag(
-                self.bars, c.flag_freq[self.horizon_key], self.ds.times[self.fold.test[0]],
+                self.bars, per_horizon(c.flag_freq, self.horizon_key), self.ds.times[self.fold.test[0]],
                 n_states=c.flag_states, features=c.flag_features, threshold=c.flag_threshold,
                 restarts=c.flag_restarts, seed=c.seed,
             )
@@ -271,11 +291,11 @@ class FoldContext:
             bars = self.bars.assign(stress_prob=fit.at(self.bars.index + pd.Timedelta(self.spec.bar_freq)))
             spec = replace(self.spec, dims=tuple(self.spec.dims) + ("stress",))
             extra = "|".join(map(str, [
-                self.ds.times[self.fold.test[0]], c.flag_states, c.flag_features, c.flag_freq[self.horizon_key],
+                self.ds.times[self.fold.test[0]], c.flag_states, c.flag_features, per_horizon(c.flag_freq, self.horizon_key),
                 c.flag_restarts, c.seed,
             ]))
             ds = get_dataset(bars, spec, c, include_seq=False,
-                             sub_window=c.lstm_sub_window[self.horizon_key], extra=extra)
+                             sub_window=per_horizon(c.lstm_sub_window, self.horizon_key), extra=extra)
             if not (ds.times == self.ds.times).all():
                 raise RuntimeError("Stress-dimension rows differ from the base dataset.")
             self.flag_cache[key] = ds
@@ -299,6 +319,11 @@ class FoldContext:
             "seq": d.X_seq,
             "lag": d.X_lag,
             "multi": d.X_multi,
+            "isig": d.X_isig,
+            "ilag": d.X_ilag,
+            "imulti": d.X_imulti,
+            "harrv": d.X_harrv,
+            "isig+harrv": None if d.X_isig is None else np.hstack([d.X_isig, d.X_harrv]),
         }[kind]
 
     def xy(self, kind: str):
@@ -313,6 +338,7 @@ class ModelSpec:
     horizons: tuple | None = None  # None -> every horizon
     needs_seq: bool = False
     needs_flag: bool = False  # uses the HMM anomaly flag
+    needs_intraday: bool = False  # uses intraday-path features (only the *_i horizons have them)
 
 
 def _mean(c):
@@ -378,7 +404,7 @@ def _mlp(kind):
             model = fit_mlp_tuned(Xtr, c.y_train, fit, val, max_epochs=c.cfg.torch_epochs,
                                   patience=c.cfg.nn_patience, random_state=seed)
         else:
-            model = fit_mlp(Xtr, c.y_train, weight_decay=c.cfg.weight_decay[c.horizon_key],
+            model = fit_mlp(Xtr, c.y_train, weight_decay=per_horizon(c.cfg.weight_decay, c.horizon_key),
                             epochs=c.cfg.torch_epochs, random_state=seed)
         return model.predict(Xte)
 
@@ -393,9 +419,16 @@ def _lstm(c):
         model = fit_lstm_tuned(Xtr, c.y_train, fit, val, max_epochs=c.cfg.torch_epochs,
                                patience=c.cfg.nn_patience, random_state=seed)
     else:
-        model = fit_signature_lstm(Xtr, c.y_train, weight_decay=c.cfg.weight_decay[c.horizon_key],
+        model = fit_signature_lstm(Xtr, c.y_train, weight_decay=per_horizon(c.cfg.weight_decay, c.horizon_key),
                                    epochs=c.cfg.torch_epochs, random_state=seed)
     return model.predict(Xte)
+
+
+def _har_intraday(c):
+    d, tr, te = c.ds, c.fold.train, c.fold.test
+    return evaluate_har_log(
+        d.X_harrv[tr], d.y_har_log[tr], d.X_harrv[te], c.y_test, c.horizon_steps
+    ).predictions
 
 
 def _har_flag(c):
@@ -438,6 +471,12 @@ MODELS: dict[str, ModelSpec] = {
         ModelSpec("MLP | stats", _mlp("stats")),
         ModelSpec("MLP | stats+signature", _mlp("stats+sig")),
         ModelSpec("Signature LSTM", _lstm, needs_seq=True),
+        # intraday paths -> daily/weekly forecasts (only on the *_i horizons)
+        ModelSpec("HAR-RV-L (intraday RV)", _har_intraday, needs_intraday=True),
+        ModelSpec("Ridge | intraday signature", _ridge("isig"), needs_intraday=True),
+        ModelSpec("Ridge | intraday lag bank (matched)", _ridge("ilag"), needs_intraday=True),
+        ModelSpec("Ridge | intraday multiscale stats", _ridge("imulti"), needs_intraday=True),
+        ModelSpec("Ridge | intraday signature + HAR-RV", _ridge("isig+harrv"), needs_intraday=True),
         # with the HMM anomaly flag: as columns, or as an extra signature path dimension
         ModelSpec("HAR-RV-L + flag", _har_flag, needs_flag=True),
         ModelSpec("Ridge | signature + flag", _ridge_flag, needs_flag=True),
@@ -477,6 +516,8 @@ def evaluate_models(
                 continue
             if model.needs_flag and (not cfg.use_flag or bars is None):
                 continue
+            if model.needs_intraday and ds.X_isig is None:
+                continue  # intraday models need intraday features (only the *_i horizons have them)
             t0 = time.time()
             pred = np.maximum(np.asarray(model.fit_predict(ctx), dtype=float), EPS)
             rows.append(
@@ -527,6 +568,22 @@ def load_bars(horizon: str, cfg: ExperimentConfig) -> pd.DataFrame:
     )
 
 
+_INTRADAY_MEMO: dict = {}
+
+
+def load_intraday(cfg: ExperimentConfig) -> pd.DataFrame:
+    """Hourly bars from Binance klines for the *_i horizons (cached per month on disk)."""
+    end = cfg.intraday_end or cfg.yahoo_end or str(pd.Timestamp.now(tz="UTC").date())
+    key = (cfg.symbol, cfg.intraday_start, end)
+    if key not in _INTRADAY_MEMO:
+        _INTRADAY_MEMO.clear()
+        _INTRADAY_MEMO[key] = fetch_binance_klines_hourly(
+            cfg.intraday_start, end, symbol=cfg.symbol, data_dir=Path(cfg.data_dir) / "klines",
+            force_download=cfg.force_download,
+        )
+    return _INTRADAY_MEMO[key]
+
+
 def choose_stride(n_bars: int, spec: ForecastSpec, target_rows: int | None) -> int:
     if not target_rows:
         return 1
@@ -554,7 +611,7 @@ def base_spec_for(horizon: str, bars: pd.DataFrame, cfg: ExperimentConfig) -> Fo
             "in every fold, so it is only added by the 'Ridge | signature + stress dim' model."
         )
     spec = replace(spec, **overrides)
-    return replace(spec, sample_stride=choose_stride(len(bars), spec, cfg.target_rows.get(horizon)))
+    return replace(spec, sample_stride=choose_stride(len(bars), spec, cfg.target_rows.get(horizon, cfg.target_rows.get(base_key(horizon)))))
 
 
 def _utc_index(values) -> pd.DatetimeIndex:
@@ -564,12 +621,15 @@ def _utc_index(values) -> pd.DatetimeIndex:
 def get_dataset(
     bars: pd.DataFrame, spec: ForecastSpec, cfg: ExperimentConfig, *, include_seq: bool, sub_window: str,
     extra: str = "",
+    intraday: pd.DataFrame | None = None,
 ) -> ForecastDataset:
     """Build features once and cache to disk, keyed by spec + data fingerprint."""
     fingerprint = {
         "v": FEATURE_VERSION, "spec": asdict(spec), "seq": include_seq, "sub": sub_window,
         "n": len(bars), "first": str(bars.index[0]), "last": str(bars.index[-1]),
         "close_sum": round(float(bars["close"].sum()), 6), "extra": extra,
+        "intraday": None if intraday is None else [
+            len(intraday), str(intraday.index[0]), str(intraday.index[-1]), round(float(intraday["close"].sum()), 6)],
     }
     key = hashlib.md5(json.dumps(fingerprint, sort_keys=True, default=str).encode()).hexdigest()[:16]
     path = Path(cfg.cache_dir) / f"{spec.name}_{key}.npz"
@@ -583,12 +643,15 @@ def get_dataset(
             y_har_log=z["y_har_log"], X_seq=z["X_seq"] if "X_seq" in z.files else None,
             X_lag=z["X_lag"] if "X_lag" in z.files else None,
             X_multi=z["X_multi"] if "X_multi" in z.files else None,
+            **{k: z[k] for k in ("X_isig", "X_ilag", "X_imulti", "X_harrv") if k in z.files},
         )
 
-    ds = build_dataset(bars, spec, include_lstm_seq=include_seq, sub_window=sub_window)
+    ds = build_dataset(bars, spec, include_lstm_seq=include_seq, sub_window=sub_window, intraday=intraday)
     ds.times, ds.target_end = _utc_index(ds.times), _utc_index(ds.target_end)
     path.parent.mkdir(parents=True, exist_ok=True)
-    extra = {k: v for k, v in (("X_seq", ds.X_seq), ("X_lag", ds.X_lag), ("X_multi", ds.X_multi)) if v is not None}
+    extra = {k: v for k, v in (
+        ("X_seq", ds.X_seq), ("X_lag", ds.X_lag), ("X_multi", ds.X_multi), ("X_isig", ds.X_isig),
+        ("X_ilag", ds.X_ilag), ("X_imulti", ds.X_imulti), ("X_harrv", ds.X_harrv)) if v is not None}
     np.savez_compressed(
         path, times=to_ns(ds.times), target_end=to_ns(ds.target_end), y=ds.y, X_har=ds.X_har,
         X_stats=ds.X_stats, X_sig=ds.X_sig, y_har_log=ds.y_har_log,
@@ -649,7 +712,7 @@ def run_ablations(bars, base_spec, base_ds, folds, horizon_key, horizon_steps, c
                 continue
             ds = get_dataset(
                 bars, replace(base_spec, **changes), cfg, include_seq=False,
-                sub_window=cfg.lstm_sub_window[horizon_key],
+                sub_window=per_horizon(cfg.lstm_sub_window, horizon_key),
             )
             if not (ds.times == base_ds.times).all():
                 raise RuntimeError("Ablation rows differ from the base dataset; folds would not match.")
@@ -700,12 +763,16 @@ def run_horizon(horizon: str, cfg: ExperimentConfig) -> Path:
     bars = load_bars(horizon, cfg)
     spec = base_spec_for(horizon, bars, cfg)
     horizon_steps = duration_steps(spec.horizon, spec.bar_freq)
+    intraday = load_intraday(cfg) if horizon in INTRADAY_PATH_HORIZONS else None
+    use_flag = cfg.use_flag and intraday is None  # the flag study is on the main horizons
     names = list(cfg.models) if cfg.models else [
-        n for n, m in MODELS.items() if cfg.use_flag or not m.needs_flag
+        n for n, m in MODELS.items()
+        if (use_flag or not m.needs_flag) and (intraday is not None or not m.needs_intraday)
     ]
     need_seq = any(MODELS[n].needs_seq for n in names)
 
-    ds = get_dataset(bars, spec, cfg, include_seq=need_seq, sub_window=cfg.lstm_sub_window[horizon])
+    ds = get_dataset(bars, spec, cfg, include_seq=need_seq, sub_window=per_horizon(cfg.lstm_sub_window, horizon),
+                     intraday=intraday)
     folds = purged_walk_forward(ds.times, ds.target_end, cfg.n_folds, cfg.min_train_rows)
     returns = np.log(bars["close"]).diff().dropna() if horizon in DAILY_HORIZONS else None
     LOGGER.info(
@@ -716,16 +783,16 @@ def run_horizon(horizon: str, cfg: ExperimentConfig) -> Path:
     flag_cache: dict = {}
     metrics, preds = evaluate_models(
         ds, folds, horizon, horizon_steps, cfg, names, returns=returns,
-        bars=bars, spec=spec, flag_cache=flag_cache,
+        bars=bars if use_flag else None, spec=spec, flag_cache=flag_cache,
     )
     metrics.to_csv(out / "metrics.csv", index=False)
     preds.to_parquet(out / "predictions.parquet", index=False)
-    if cfg.use_flag:
+    if use_flag:
         flags, flag_diag = flag_outputs(ds, folds, horizon, horizon_steps, cfg, bars, spec, flag_cache)
         flags.to_parquet(out / "flags.parquet", index=False)
         flag_diag.to_csv(out / "flag_diagnostics.csv", index=False)
 
-    if cfg.run_ablations:
+    if cfg.run_ablations and intraday is None:
         ablations = run_ablations(bars, spec, ds, folds, horizon, horizon_steps, cfg, returns)
         ablations.to_csv(out / "ablations.csv", index=False)
 
@@ -736,6 +803,7 @@ def run_horizon(horizon: str, cfg: ExperimentConfig) -> Path:
         "n_rows": int(len(ds.y)), "n_folds": len(folds),
         "fold_sizes": [[len(f.train), len(f.test)] for f in folds],
         "first_time": str(ds.times[0]), "last_time": str(ds.times[-1]),
+        "intraday_paths": intraday is not None,
         "seconds": round(time.time() - t0, 1),
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=2))  # written last = "complete"

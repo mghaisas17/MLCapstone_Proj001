@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 import logging
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
@@ -43,6 +43,11 @@ class ForecastSpec:
     path_points: int | None = None
     sample_stride: int = 1
     variance_method: str = "close"
+    # Intraday-path mode: rows, target, HAR and stats stay on the daily bars; the signature (and its
+    # controls) are computed from the intraday bars covering the same lookback instead.
+    intraday_freq: str | None = None
+    intraday_dims: tuple | None = None  # None -> same as `dims`
+    intraday_path_points: int | None = None  # None -> native intraday resolution
 
 
 SPECS: dict[str, ForecastSpec] = {
@@ -98,6 +103,10 @@ SPECS: dict[str, ForecastSpec] = {
 }
 
 
+for _key in ("1d", "7d", "30d"):  # same rows/target/baselines as the daily horizons, signature from hourly paths
+    SPECS[f"{_key}_i"] = replace(SPECS[_key], name=f"{_key}_i", intraday_freq="1h")
+
+
 @dataclass
 class ForecastDataset:
     times: np.ndarray
@@ -113,6 +122,11 @@ class ForecastDataset:
     # Non-signature controls, built from the same window as X_sig:
     X_lag: np.ndarray | None = None  # flat lag bank with exactly as many columns as X_sig
     X_multi: np.ndarray | None = None  # hand-built multi-scale realized-volatility features
+    # Intraday-path features (only for specs with intraday_freq); same rows as everything above:
+    X_isig: np.ndarray | None = None  # signature of the intraday path
+    X_ilag: np.ndarray | None = None  # lag bank with exactly as many columns as X_isig
+    X_imulti: np.ndarray | None = None  # multi-scale realized-variance features from intraday returns
+    X_harrv: np.ndarray | None = None  # HAR-RV-L features from intraday realized variance
 
 
 STAT_NAMES = [
@@ -693,7 +707,8 @@ def har_log_features(bars: pd.DataFrame, i: int, har_steps: list[int]) -> np.nda
     log_rvs = [
         np.log(max(var_inc[i - w + 1 : i + 1].mean(), 0.0) + EPS) for w in har_steps
     ]
-    ret = np.log(bars["close"].iloc[i] / bars["close"].iloc[i - 1])
+    # return over the shortest HAR window (one day), which is one bar for daily bars
+    ret = np.log(bars["close"].iloc[i] / bars["close"].iloc[i - har_steps[0]])
     leverage = min(ret, 0.0)
     return np.array([*log_rvs, leverage], dtype=np.float32)
 
@@ -727,12 +742,55 @@ def chunk_signatures(window: pd.DataFrame, sub_window_steps: int, spec: Forecast
     )
 
 
+def _ns(index) -> np.ndarray:
+    idx = pd.DatetimeIndex(index)
+    idx = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+    return np.asarray(idx.tz_localize(None), dtype="datetime64[ns]")
+
+
+class _IntradayWindows:
+    """Intraday bars matched to the daily rows. A row labelled day D is known at the end of D, so its
+    intraday window is the ``lookback`` of bars ending with the last bar of D and nothing later."""
+
+    def __init__(self, intra: pd.DataFrame, ends: np.ndarray, spec: ForecastSpec):
+        self.intra = intra
+        self.ends = ends  # position just past the last intraday bar of each kept row
+        self.lookback = duration_steps(spec.lookback, spec.intraday_freq)
+        self.har_steps = [duration_steps(w, spec.intraday_freq) for w in spec.har_windows]
+        self.var_frame = intra
+
+    def window(self, k: int) -> tuple[pd.DataFrame, int]:
+        j1 = int(self.ends[k])
+        return self.intra.iloc[j1 - self.lookback : j1], j1
+
+
+def _intraday_alignment(bars, intraday, spec, candidates):
+    """Keep only rows with a complete intraday window and no look-ahead; return them with the windows."""
+    intra = add_variance_increment(intraday, method="close")
+    freq = pd.Timedelta(spec.intraday_freq)
+    cand = np.asarray(candidates)
+    known = _ns(bars.index[cand] + pd.Timedelta(spec.bar_freq))
+    labels = _ns(intra.index)
+    j1 = np.searchsorted(labels, known, side="left")  # first bar not yet known
+    need = max(
+        duration_steps(spec.lookback, spec.intraday_freq),
+        max(duration_steps(w, spec.intraday_freq) for w in spec.har_windows),
+    )
+    ok = (j1 >= need) & (j1 <= len(labels))
+    last = np.where(ok, labels[np.clip(j1 - 1, 0, len(labels) - 1)], np.datetime64("NaT"))
+    ok &= last == (known - np.timedelta64(int(freq.value), "ns"))  # the window ends exactly at the row's known time
+    if not ok.any():
+        raise ValueError("No daily rows have a complete intraday window; check the intraday date range.")
+    return cand[ok], _IntradayWindows(intra, j1[ok], spec)
+
+
 def build_dataset(
     bars: pd.DataFrame,
     spec: ForecastSpec,
     progress_every: int | None = None,
     include_lstm_seq: bool = False,
     sub_window: str = "5D",
+    intraday: pd.DataFrame | None = None,
 ) -> ForecastDataset:
     """
     Single pass over `bars` that builds every feature representation at once
@@ -757,6 +815,11 @@ def build_dataset(
         len(bars) - horizon_steps,
         spec.sample_stride,
     )
+    intra = None
+    if spec.intraday_freq:
+        if intraday is None:
+            raise ValueError(f"Spec {spec.name} uses intraday paths; pass the intraday bars.")
+        candidate_indices, intra = _intraday_alignment(bars, intraday, spec, candidate_indices)
     total = len(candidate_indices)
     if total <= 0:
         raise ValueError(
@@ -771,6 +834,7 @@ def build_dataset(
     y_list, har_list, har_log_y_list, stat_list, sig_list = [], [], [], [], []
     lag_list, multi_list = [], []
     seq_list = [] if include_lstm_seq else None
+    isig_list, ilag_list, imulti_list, harrv_list = [], [], [], []
 
     for count, i in enumerate(candidate_indices, start=1):
         if count == 1 or count % progress_every == 0 or count == total:
@@ -791,6 +855,16 @@ def build_dataset(
         multi_list.append(multiscale_features(window))
         if include_lstm_seq:
             seq_list.append(chunk_signatures(window, sub_window_steps, spec))
+        if intra is not None:
+            iw, j1 = intra.window(count - 1)
+            ispec = replace(
+                spec, dims=tuple(spec.intraday_dims or spec.dims), path_points=spec.intraday_path_points
+            )
+            isig = signature_features(make_path(iw, ispec), spec.depth)
+            isig_list.append(isig)
+            ilag_list.append(lag_bank_features(iw, ispec, isig.shape[0]))
+            imulti_list.append(multiscale_features(iw))
+            harrv_list.append(har_log_features(intra.var_frame, j1 - 1, intra.har_steps))
 
     dataset = ForecastDataset(
         times=np.asarray(times),
@@ -805,6 +879,10 @@ def build_dataset(
         X_seq=np.stack(seq_list).astype(np.float32) if include_lstm_seq else None,
         X_lag=np.asarray(lag_list, dtype=np.float32),
         X_multi=np.asarray(multi_list, dtype=np.float32),
+        X_isig=np.asarray(isig_list, dtype=np.float32) if intra is not None else None,
+        X_ilag=np.asarray(ilag_list, dtype=np.float32) if intra is not None else None,
+        X_imulti=np.asarray(imulti_list, dtype=np.float32) if intra is not None else None,
+        X_harrv=np.asarray(harrv_list, dtype=np.float32) if intra is not None else None,
     )
     LOGGER.info(
         "Finished dataset: n=%s | HAR=%s | stats=%s | signature=%s | seq=%s",
@@ -1064,3 +1142,108 @@ def fetch_binance_bars(
     if not per_freq[freqs[0]]:
         raise ValueError("No Binance data could be loaded for the requested date range.")
     return {f: _fill_bar_gaps(pd.concat(parts), f) for f, parts in per_freq.items()}
+
+
+# --------------------------------------------------------------------------
+# Hourly bars from Binance 1-minute klines (long history for intraday paths)
+#
+# Klines are one row per minute (~0.7M rows a year), so they reach back to 2017-08
+# at a fraction of the size of the trade files. Each carries the traded quote volume
+# and the taker-buy quote volume, which gives the same dollar volume and signed flow
+# columns as the trade-based bars (flow = taker buy - taker sell).
+# --------------------------------------------------------------------------
+
+KLINE_COLUMNS = [
+    "open_time", "open", "high", "low", "close", "volume", "close_time",
+    "quote_volume", "count", "taker_buy_base", "taker_buy_quote", "ignore",
+]
+KLINES_START = pd.Timestamp("2017-08-01")
+
+
+def _klines_to_hourly(df: pd.DataFrame, freq: str = "1h") -> pd.DataFrame:
+    df = df[pd.to_numeric(df["open_time"], errors="coerce").notna()].copy()  # tolerate a header row
+    ts = _parse_binance_timestamp(df["open_time"])
+    num = {c: pd.to_numeric(df[c], errors="coerce") for c in
+           ("open", "high", "low", "close", "volume", "quote_volume", "taker_buy_quote")}
+    d = pd.DataFrame(num)
+    d["signed"] = 2.0 * d["taker_buy_quote"] - d["quote_volume"]
+    d.index = ts
+    d = d.loc[d.index.notna()].sort_index()
+    g = d.groupby(d.index.floor(freq))
+    return pd.DataFrame(
+        {
+            "open": g["open"].first(), "high": g["high"].max(), "low": g["low"].min(),
+            "close": g["close"].last(), "volume": g["volume"].sum(),
+            "dollar_volume": g["quote_volume"].sum(), "signed_dollar_flow": g["signed"].sum(),
+        }
+    )
+
+
+def _download_klines(url: str, timeout: int = 120) -> pd.DataFrame:
+    import tempfile
+
+    with tempfile.TemporaryFile() as tmp:
+        with requests.get(url, timeout=timeout, stream=True) as response:
+            if response.status_code != 200:
+                raise FileNotFoundError(f"Binance klines unavailable: {url} (HTTP {response.status_code})")
+            for block in response.iter_content(chunk_size=1 << 20):
+                tmp.write(block)
+        tmp.seek(0)
+        with zipfile.ZipFile(tmp) as zf:
+            with zf.open(zf.namelist()[0]) as handle:
+                return pd.read_csv(handle, header=None, names=KLINE_COLUMNS, usecols=range(11), dtype=str)
+
+
+def fetch_binance_klines_hourly(
+    start: str | date,
+    end: str | date,
+    symbol: str = "BTCUSDT",
+    data_dir: str | Path = "data/klines",
+    force_download: bool = False,
+    freq: str = "1h",
+) -> pd.DataFrame:
+    """Hourly OHLC + dollar volume + signed flow for an inclusive date range, built a month at a
+    time (daily files for months without a monthly archive, e.g. the current one) and cached."""
+    base = "https://data.binance.vision/data/spot"
+    data_dir = _ensure_data_dir(data_dir)
+    start_ts = max(pd.Timestamp(start), KLINES_START)
+    end_ts = pd.Timestamp(end)
+    pieces: list[pd.DataFrame] = []
+
+    def cached(path, build):
+        if path.exists() and not force_download:
+            try:
+                return pd.read_parquet(path)
+            except Exception:
+                path.unlink(missing_ok=True)
+        out = build()
+        out.to_parquet(path)
+        return out
+
+    for month in pd.period_range(start_ts, end_ts, freq="M"):
+        tag = month.strftime("%Y-%m")
+        try:
+            LOGGER.info("Klines %s %s (monthly)", symbol, tag)
+            pieces.append(cached(
+                data_dir / f"{symbol}_{freq}_{tag}.parquet",
+                lambda: _klines_to_hourly(
+                    _download_klines(f"{base}/monthly/klines/{symbol}/1m/{symbol}-1m-{tag}.zip"), freq),
+            ))
+            continue
+        except FileNotFoundError:
+            pass  # not published yet (current month): fall back to daily files
+        for day in pd.date_range(max(month.start_time, start_ts), min(month.end_time.normalize(), end_ts)):
+            dtag = day.strftime("%Y-%m-%d")
+            try:
+                pieces.append(cached(
+                    data_dir / f"{symbol}_{freq}_{dtag}.parquet",
+                    lambda: _klines_to_hourly(
+                        _download_klines(f"{base}/daily/klines/{symbol}/1m/{symbol}-1m-{dtag}.zip"), freq),
+                ))
+            except FileNotFoundError as exc:
+                LOGGER.warning("%s", exc)
+    if not pieces:
+        raise ValueError("No Binance klines could be loaded for the requested date range.")
+    bars = _fill_bar_gaps(pd.concat(pieces), freq)
+    bars = bars.loc[(bars.index >= start_ts.tz_localize("UTC")) & (bars.index < (end_ts + pd.Timedelta(days=1)).tz_localize("UTC"))]
+    return bars

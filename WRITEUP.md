@@ -553,6 +553,39 @@ and it gives no forecasting benefit at daily or longer horizons. Ways to make it
 carry new information would be to give the HMM inputs the forecasters do not
 use, or to use it for gating or risk decisions, not as an extra regressor.
 
+### 5.6 Intraday paths for the daily and weekly forecasts (implemented, not yet run)
+
+**Why.** At 1, 7 and 30 days the signature is computed from only 30 daily points, and
+a flat lag bank on the same channels matched it (§5.3). Signatures should earn
+their keep where a path has rich within-window structure, so the next test gives
+them the hourly path.
+
+**Design** (horizons `1d_i`, `7d_i`, `30d_i`):
+- The rows, the daily-bar target and every baseline are identical to the daily
+  horizons, restricted to dates with intraday coverage (from about Sept 2017).
+  Only the path fed to the signature changes: the hourly path (price, activity,
+  range) over the same 30-day lookback, at native resolution.
+- Hourly bars are built from Binance 1-minute klines (monthly archives, with the
+  traded quote volume and taker-buy volume giving dollar volume and signed flow),
+  cached per month.
+- A row labelled day D is known at the end of D, so its intraday window ends with
+  the last hourly bar of D and nothing later. A test changes only future bars and
+  confirms no earlier feature moves.
+- New models on those identical rows: `Ridge | intraday signature`; its controls
+  from the same hourly window, `Ridge | intraday lag bank (matched)` (same number
+  of columns) and `Ridge | intraday multiscale stats`; `HAR-RV-L (intraday RV)`
+  (HAR on realized variance from hourly returns, the standard strong baseline);
+  and `Ridge | intraday signature + HAR-RV` (does the signature add to that baseline?).
+- Comparison table: `intraday_table`. The questions: does the intraday signature
+  beat the daily-path signature, its matched controls, and HAR on intraday
+  realized variance, and does it add anything on top of that HAR?
+
+**What would count as a result.** The signature is useful only if it beats the
+matched lag bank and the multi-scale realized-variance features built from the
+same hourly window, and adds to the intraday-RV HAR. If the intraday-RV HAR alone
+closes most of the gap to Ridge, the earlier 8–13% gain over HAR was mostly the
+weakness of the daily-bar HAR.
+
 ## 6. Cross-cutting issues and limitations
 
 - **Single asset.** Everything is BTC. There is no FX/equity test, although the
