@@ -96,11 +96,14 @@ class GaussianHMM:
             gamma = np.exp(log_gamma)
 
             log_A = np.log(self.transmat_ + 1e-300)
-            xi_sum = np.zeros((K, K))
-            for t in range(T - 1):
-                log_xi_t = (log_alpha[t][:, None] + log_A + log_B[t + 1][None, :]
-                            + log_beta[t + 1][None, :] - ll)
-                xi_sum += np.exp(log_xi_t)
+            # Vectorized over t (was a per-t Python loop -- O(T) Python-level
+            # overhead per EM iteration, which dominates runtime once T is in
+            # the tens of thousands, e.g. pooled 5-minute-bar training sets).
+            # Same math: log_xi_t = log_alpha[t] (x) log_A (x) log_B[t+1] (x)
+            # log_beta[t+1] - ll, summed over t=0..T-2.
+            log_xi_all = (log_alpha[:-1][:, :, None] + log_A[None, :, :]
+                          + log_B[1:][:, None, :] + log_beta[1:][:, None, :] - ll)
+            xi_sum = np.exp(log_xi_all).sum(axis=0)
 
             # M-step
             self.startprob_ = gamma[0] / gamma[0].sum()
