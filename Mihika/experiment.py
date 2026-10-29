@@ -52,6 +52,7 @@ from models_and_metrics import (
     evaluate_garch,
     evaluate_garch_rolling,
     evaluate_har_log,
+    fit_har_log,
     fit_lstm_tuned,
     fit_mlp,
     fit_mlp_tuned,
@@ -59,6 +60,7 @@ from models_and_metrics import (
     fit_xgb,
     fit_xgb_tuned,
     inner_holdout,
+    predict_har_log,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -141,6 +143,10 @@ class ExperimentConfig:
 
     # HMM anomaly flag (see anomaly_flag.py), added as an input to the forecasts
     use_flag: bool = True
+    # Anomaly scores selected by the anomaly/ study, used on the *_i horizons (same post-2017 rows)
+    use_anomaly: bool = False
+    anomaly_selection: str | None = None  # path to anomaly/results/anomaly/best_configs.json
+    anomaly_flag_rate: float = 0.05  # flag = score above the training rows' 95th percentile
     flag_states: int = 3  # the flag marks the highest-volatility state
     flag_features: tuple = ("ret", "log_range", "rel_volume", "flow_imbalance", "trailing_vol")
     flag_threshold: float = 0.5  # flag = filtered P(stress state) >= threshold
@@ -283,6 +289,17 @@ class FoldContext:
         keep = cols[self.fold.train].std(axis=0) > 1e-9
         return cols[:, keep]
 
+    # ---- anomaly score from the anomaly/ study, refit per fold on rows before the test block
+    def anomaly_cols(self, which: str) -> np.ndarray:
+        """[score, flag] for every row; ``which`` is "sig" (best signature detector) or "free"
+        (best signature-free detector) from best_configs.json."""
+        key = ("anomaly", which, self.fold.number)
+        if key not in self.flag_cache:
+            self.flag_cache[key] = _anomaly_scores(self, which)
+        score = self.flag_cache[key]
+        thr = np.quantile(score[self.fold.train], 1 - self.cfg.anomaly_flag_rate)
+        return np.column_stack([score, (score >= thr).astype(float)])
+
     def stress_dataset(self) -> ForecastDataset:
         """Signature features with the stress probability added as a path dimension."""
         key = ("stress", self.fold.number)
@@ -339,6 +356,7 @@ class ModelSpec:
     needs_seq: bool = False
     needs_flag: bool = False  # uses the HMM anomaly flag
     needs_intraday: bool = False  # uses intraday-path features (only the *_i horizons have them)
+    needs_anomaly: bool = False  # uses the anomaly score (use_anomaly, *_i horizons in best_configs.json)
 
 
 def _mean(c):
@@ -431,6 +449,147 @@ def _har_intraday(c):
     ).predictions
 
 
+# ---- anomaly score in the forecasts: as a feature, as a residual correction, as a regime gate
+
+
+def _anomaly_settings(cfg):
+    """(selection dict, anomaly config) from the anomaly study's output folder."""
+    root = Path(__file__).resolve().parent.parent
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from anomaly.config import AnomalyConfig
+
+    sel_path = Path(cfg.anomaly_selection)
+    selection = json.loads(sel_path.read_text())
+    conf = sel_path.parent / "config.json"
+    return selection, (AnomalyConfig.from_json(conf) if conf.exists() else AnomalyConfig())
+
+
+def anomaly_available(cfg, horizon_key: str) -> bool:
+    if not cfg.use_anomaly or not cfg.anomaly_selection or horizon_key not in INTRADAY_PATH_HORIZONS:
+        return False
+    if not Path(cfg.anomaly_selection).exists():
+        raise FileNotFoundError(f"anomaly_selection not found: {cfg.anomaly_selection}")
+    return base_key(horizon_key) in _anomaly_settings(cfg)[0]
+
+
+def _anomaly_scores(ctx, which: str) -> np.ndarray:
+    """Score every vol row with the selected anomaly detector, fit on this fold's training rows.
+
+    Each vol row (day D, known at the end of D) gets the anomaly window that ends with the last
+    bar completed by then, exactly as in the anomaly study; nothing later is used."""
+    from anomaly import config as AC
+    from anomaly import detectors as AD
+    from anomaly import features as AF
+    from anomaly.run import _rep_of_key
+
+    cfg, ds, fold = ctx.cfg, ctx.ds, ctx.fold
+    selection, acfg = _anomaly_settings(cfg)
+    hk = base_key(ctx.horizon_key)
+    choice = selection[hk]["best_signature" if which == "sig" else "best_signature_free"]
+    spec = AC.HORIZONS[hk]
+
+    cache_key = ("anomaly_rows", which)
+    if cache_key not in ctx.flag_cache:
+        end = acfg.end or cfg.intraday_end or cfg.yahoo_end or str(pd.Timestamp.now(tz="UTC").date())
+        bars = fetch_binance_klines_hourly(acfg.start, end, symbol=cfg.symbol,
+                                           data_dir=Path(acfg.data_dir) / "klines", freq=spec.bar_freq)
+        known = ds.times + pd.Timedelta(ctx.spec.bar_freq)
+        freq = pd.Timedelta(spec.bar_freq)
+        pos = np.searchsorted(to_ns(bars.index), to_ns(known - freq), side="right") - 1  # last complete bar
+        X, valid = None, pos >= 0
+        if choice["Kind"] == "baseline":
+            r = AF.bar_returns(bars)
+            csum = np.concatenate([[0.0], np.cumsum(r**2)])
+            har = [duration_steps(w, spec.bar_freq) for w in spec.har_windows]
+            h = duration_steps(spec.horizon, spec.bar_freq)
+            valid &= pos + 1 >= max(har)
+            p = np.where(valid, pos, max(har))
+            X = np.column_stack([np.log((csum[p + 1] - csum[p + 1 - w]) / w + EPS) for w in har])
+            fut = np.minimum(p + 1 + h, len(csum) - 1)
+            ctx.flag_cache[("anomaly_y", which)] = 0.5 * np.log(csum[fut] - csum[p + 1] + EPS)
+        else:
+            rep = _rep_of_key(choice["Config"], acfg)
+            W = int(round(spec.window * rep.window_mult))
+            valid &= pos >= 2 * W - 1  # the trailing-vol normalization needs W earlier bars
+            win = AF.extract_windows(bars, pos[valid], W, rep.normalize)
+            X = AF.representations(win, rep, spec, acfg.depths, acfg.max_sig_features)[choice["Config"].split(" | ")[0]]
+        ctx.flag_cache[cache_key] = (X, valid)
+    X, valid = ctx.flag_cache[cache_key]
+
+    score = np.full(len(ds.y), np.nan)
+    train_valid = valid[fold.train]
+    if choice["Kind"] == "baseline":
+        if choice["Config"] == "vol level":
+            score[valid] = X[valid, 0]
+        else:  # "HAR forecast": the anomaly study's HAR, fit on this fold's training rows
+            y = ctx.flag_cache[("anomaly_y", which)]
+            A = np.column_stack([np.ones(len(X)), X])
+            tr = fold.train[train_valid]
+            beta, *_ = np.linalg.lstsq(A[tr], y[tr], rcond=None)
+            score[valid] = (A @ beta)[valid]
+    else:
+        idx = np.cumsum(valid) - 1  # row -> position among valid rows
+        model = AD.make(choice["Detector"], acfg).fit(X[idx[fold.train[train_valid]]])
+        score[valid] = model.score(X)  # all valid rows, in time order (the HMM needs that)
+    fill = np.nanmedian(score[fold.train]) if np.isfinite(score[fold.train]).any() else 0.0
+    return np.where(np.isfinite(score), score, fill)
+
+
+def _har_anomaly(which):
+    def run(c):
+        d, tr, te = c.ds, c.fold.train, c.fold.test
+        X = np.hstack([d.X_har, c.anomaly_cols(which)])
+        return evaluate_har_log(X[tr], d.y_har_log[tr], X[te], c.y_test, c.horizon_steps).predictions
+
+    return run
+
+
+def _ridge_sig_anomaly(which):
+    def run(c):
+        d, tr, te = c.ds, c.fold.train, c.fold.test
+        X = np.hstack([d.X_sig, c.anomaly_cols(which)])
+        return fit_ridge(X[tr], c.y_train, d.times[tr], d.target_end[tr]).predict(X[te])
+
+    return run
+
+
+def _har_anomaly_residual(which):
+    """HAR-RV-L, then a Ridge model of its log error from the anomaly score, the flag and
+    score x log(HAR forecast); prediction = HAR x exp(predicted error), smearing-corrected."""
+    def run(c):
+        d, tr, te = c.ds, c.fold.train, c.fold.test
+        har = fit_har_log(d.X_har[tr], d.y_har_log[tr])
+        base = predict_har_log(har, d.X_har, har.resid, c.horizon_steps)
+        cols = c.anomaly_cols(which)
+        Z = np.column_stack([cols, cols[:, 0] * np.log(base)])
+        resid = np.log(np.maximum(d.y, EPS)) - np.log(base)
+        model = fit_ridge(Z[tr], resid[tr], d.times[tr], d.target_end[tr])
+        smear = float(np.mean(np.exp(resid[tr] - model.predict(Z[tr]))))
+        return base[te] * np.exp(model.predict(Z[te])) * smear
+
+    return run
+
+
+def _har_anomaly_gated(which):
+    """HAR-RV-L whose coefficients may differ when the anomaly flag is on (flag x HAR terms);
+    plain HAR-RV-L if fewer than 30 training rows are flagged."""
+    def run(c):
+        d, tr, te = c.ds, c.fold.train, c.fold.test
+        flag = c.anomaly_cols(which)[:, 1:2]
+        X = d.X_har if flag[tr].sum() < 30 else np.hstack([d.X_har, flag, d.X_har * flag])
+        return evaluate_har_log(X[tr], d.y_har_log[tr], X[te], c.y_test, c.horizon_steps).predictions
+
+    return run
+
+
+ANOMALY_VARIANTS = {"sig": "signature detector", "free": "signature-free detector"}
+
+
+def anomaly_model_names() -> list[str]:
+    return [n for n, m in MODELS.items() if m.needs_anomaly]
+
+
 def _har_flag(c):
     d, tr, te = c.ds, c.fold.train, c.fold.test
     X = np.hstack([d.X_har, c.flag_cols()])
@@ -477,6 +636,12 @@ MODELS: dict[str, ModelSpec] = {
         ModelSpec("Ridge | intraday lag bank (matched)", _ridge("ilag"), needs_intraday=True),
         ModelSpec("Ridge | intraday multiscale stats", _ridge("imulti"), needs_intraday=True),
         ModelSpec("Ridge | intraday signature + HAR-RV", _ridge("isig+harrv"), needs_intraday=True),
+        # anomaly score from the anomaly/ study (signature vs signature-free detector)
+        *[ModelSpec(f"{label} [{w}]", fn(w), needs_anomaly=True)
+          for w in ANOMALY_VARIANTS
+          for label, fn in (("HAR-RV-L + anomaly", _har_anomaly), ("Ridge | signature + anomaly", _ridge_sig_anomaly),
+                            ("HAR-RV-L + anomaly residual", _har_anomaly_residual),
+                            ("HAR-RV-L | anomaly-gated", _har_anomaly_gated))],
         # with the HMM anomaly flag: as columns, or as an extra signature path dimension
         ModelSpec("HAR-RV-L + flag", _har_flag, needs_flag=True),
         ModelSpec("Ridge | signature + flag", _ridge_flag, needs_flag=True),
@@ -508,6 +673,8 @@ def evaluate_models(
 ):
     rows, preds = [], []
     flag_cache = {} if flag_cache is None else flag_cache
+    anomaly_ok = spec is not None and any(MODELS[n].needs_anomaly for n in model_names) and \
+        anomaly_available(cfg, horizon_key)
     for fold in folds:
         ctx = FoldContext(ds, fold, horizon_key, horizon_steps, cfg, returns, bars, spec, flag_cache)
         for name in model_names:
@@ -518,6 +685,8 @@ def evaluate_models(
                 continue
             if model.needs_intraday and ds.X_isig is None:
                 continue  # intraday models need intraday features (only the *_i horizons have them)
+            if model.needs_anomaly and not anomaly_ok:
+                continue
             t0 = time.time()
             pred = np.maximum(np.asarray(model.fit_predict(ctx), dtype=float), EPS)
             rows.append(
@@ -752,6 +921,20 @@ def flag_outputs(ds, folds, horizon_key, horizon_steps, cfg, bars, spec, flag_ca
     return pd.concat(rows, ignore_index=True), pd.DataFrame(diag)
 
 
+def anomaly_outputs(ds, folds, horizon_key, horizon_steps, cfg, spec, flag_cache) -> pd.DataFrame:
+    """Out-of-sample anomaly score and flag per test row, for both detectors."""
+    rows = []
+    for fold in folds:
+        ctx = FoldContext(ds, fold, horizon_key, horizon_steps, cfg, None, None, spec, flag_cache)
+        for which in ANOMALY_VARIANTS:
+            cols = ctx.anomaly_cols(which)
+            rows.append(pd.DataFrame({
+                "HorizonKey": horizon_key, "Horizon": HORIZON_LABELS[horizon_key], "Fold": fold.number,
+                "Which": which, "Time": ds.times[fold.test], "score": cols[fold.test, 0], "flag": cols[fold.test, 1],
+            }))
+    return pd.concat(rows, ignore_index=True)
+
+
 def run_horizon(horizon: str, cfg: ExperimentConfig) -> Path:
     out = Path(cfg.output_dir) / horizon
     if cfg.resume and (out / "meta.json").exists():
@@ -765,9 +948,11 @@ def run_horizon(horizon: str, cfg: ExperimentConfig) -> Path:
     horizon_steps = duration_steps(spec.horizon, spec.bar_freq)
     intraday = load_intraday(cfg) if horizon in INTRADAY_PATH_HORIZONS else None
     use_flag = cfg.use_flag and intraday is None  # the flag study is on the main horizons
+    use_anomaly = anomaly_available(cfg, horizon)
     names = list(cfg.models) if cfg.models else [
         n for n, m in MODELS.items()
         if (use_flag or not m.needs_flag) and (intraday is not None or not m.needs_intraday)
+        and (use_anomaly or not m.needs_anomaly)
     ]
     need_seq = any(MODELS[n].needs_seq for n in names)
 
@@ -787,6 +972,9 @@ def run_horizon(horizon: str, cfg: ExperimentConfig) -> Path:
     )
     metrics.to_csv(out / "metrics.csv", index=False)
     preds.to_parquet(out / "predictions.parquet", index=False)
+    if use_anomaly and any(MODELS[n].needs_anomaly for n in names):
+        anomaly_outputs(ds, folds, horizon, horizon_steps, cfg, spec, flag_cache).to_parquet(
+            out / "anomaly_flags.parquet", index=False)
     if use_flag:
         flags, flag_diag = flag_outputs(ds, folds, horizon, horizon_steps, cfg, bars, spec, flag_cache)
         flags.to_parquet(out / "flags.parquet", index=False)

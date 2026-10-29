@@ -119,13 +119,24 @@ def test_synthetic_order_only():
        ", ".join(f"{k} {v:.2f}" for k, v in aucs.items()))
 
 
+def test_hmm_detector():
+    X = rng.normal(size=(600, 12))
+    X[300:330] *= 6  # a burst the HMM should find unexpected
+    cfg = C.AnomalyConfig()
+    model = make("hmm", cfg).fit(X[:250])
+    full = model.score(X)
+    assert np.allclose(full[:400], model.score(X[:400])), "HMM score must only use earlier rows"
+    assert full[300:330].mean() > full[400:].mean()
+    ok("HMM detector: causal predictive-likelihood score, higher on an unexpected burst")
+
+
 def test_pipeline(tmp):
     bars = {"5min": synth_bars(12 * 24 * 70, "5min"), "1h": synth_bars(24 * 900, "1h")}
     RUN.fetch_binance_klines_hourly = lambda *a, freq="1h", **k: bars[freq]
     cfg = C.AnomalyConfig(
-        target_rows={"1h": 900, "1d": None}, min_train_rows=100,
+        horizons=("1h", "1d"), target_rows={"1h": 900, "1d": None, "7d": None}, min_train_rows=100,
         channel_sets=("price", "price+volume+range+flow"), window_mults=(1.0,), lead_lag=(True,),
-        depths=(2, 3), stage_b_top_k=1, ae_epochs=3, n_bootstrap=30,
+        depths=(2, 3), stage_b_top_k=1, stage_b_detectors=("autoencoder",), ae_epochs=3, n_bootstrap=30,
         data_dir=str(tmp / "data"), output_dir=str(tmp / "results"),
     )
     root = RUN.run_all(cfg)
@@ -134,6 +145,7 @@ def test_pipeline(tmp):
     kinds = set(res.metrics.Kind)
     assert kinds == {"signature", "lag bank", "stats", "raw", "baseline"}, kinds
     assert {"mahalanobis", "iforest", "autoencoder", "none"} <= set(res.metrics.Detector)
+    assert "hmm" not in set(res.metrics.Detector)
     dup = res.metrics.duplicated(["Horizon", "Config", "Detector", "Fold"])
     assert not dup.any(), res.metrics[dup].head()
     assert res.metrics.AUC_surprise_strat.between(0, 1).all()
@@ -155,11 +167,40 @@ def test_pipeline(tmp):
     assert not res2.metrics.duplicated(["Horizon", "Config", "Detector", "Fold"]).any()
     ok("resume: finished horizons skipped, an interrupted horizon reuses its saved parts")
 
+    # 7d on its own: finished horizons must not be re-run, best_configs.json keeps all of them
+    stamps = {f: (Path(root) / "1d" / f).stat().st_mtime for f in ("meta.json", "metrics.csv", "scores.parquet")}
+    stamps_1h = (Path(root) / "1h" / "metrics.csv").stat().st_mtime
+    cfg7 = replace(cfg, horizons=("7d",), stage_b_detectors=("autoencoder", "hmm"))
+    RUN.run_all(cfg7)
+    assert all((Path(root) / "1d" / f).stat().st_mtime == t for f, t in stamps.items()), "1d was re-run"
+    assert (Path(root) / "1h" / "metrics.csv").stat().st_mtime == stamps_1h, "1h was re-run"
+    import json as _json
+
+    best = _json.loads((Path(root) / "best_configs.json").read_text())
+    assert set(best) == {"1h", "1d", "7d"}, set(best)
+    res = R.load_results(root)
+    assert "hmm" in set(res.metrics[res.metrics.Horizon == "7d"].Detector)
+    ok("7d-only run: 1h/1d untouched, best_configs.json has all three horizons, HMM ran on 7d")
+
+    # add a detector to a finished horizon without re-running it
+    before = pd.read_csv(Path(root) / "1d" / "metrics.csv")
+    RUN.add_detector(cfg7, "1d", "hmm")
+    after = pd.read_csv(Path(root) / "1d" / "metrics.csv")
+    assert "hmm" in set(after.Detector)
+    old = after[after.Detector != "hmm"].reset_index(drop=True)
+    pd.testing.assert_frame_equal(old, before, check_dtype=False)
+    assert not after.duplicated(["Config", "Detector", "Fold"]).any()
+    RUN.add_detector(cfg7, "1d", "hmm")  # idempotent
+    assert len(pd.read_csv(Path(root) / "1d" / "metrics.csv")) == len(after)
+    ok("add_detector: HMM added to finished 1d on identical rows; existing results unchanged")
+    res = R.load_results(root)
+
     for t in (R.leaderboard(res), R.kind_table(res), R.gate_table(res), R.synthetic_table(res)):
         assert len(t) > 0
     import matplotlib.pyplot as plt
 
-    for fig in (R.plot_kind_heatmap(res), R.plot_timeline(res, "1d"), R.plot_timeline(res, "1h")):
+    for fig in (R.plot_kind_heatmap(res), R.plot_timeline(res, "1d"), R.plot_timeline(res, "1h"),
+                R.plot_timeline(res, "7d")):
         fig.savefig(tmp / "f.png", dpi=40)
         plt.close(fig)
     ok("report tables and figures")
@@ -170,5 +211,6 @@ if __name__ == "__main__":
         tmp = Path(d)
         test_no_lookahead()
         test_synthetic_order_only()
+        test_hmm_detector()
         test_pipeline(tmp)
     print("\nALL ANOMALY SMOKE CHECKS PASSED")

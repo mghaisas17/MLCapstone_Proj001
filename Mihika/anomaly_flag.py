@@ -104,6 +104,13 @@ class DiagGaussianHMM:
         alpha, _ = self._forward(B)
         return alpha
 
+    def predictive_loglik(self, X: np.ndarray) -> np.ndarray:
+        """log p(x_t | x_1..x_{t-1}) for each row, parameters held fixed (causal). Low values mean
+        the observation was unexpected given the regime the model believed it was in."""
+        B, m = self._emission(X)
+        _, c = self._forward(B)
+        return np.log(c) + m
+
 
 def to_ns(values) -> np.ndarray:
     """UTC datetimes as datetime64[ns], independent of pandas' datetime resolution."""

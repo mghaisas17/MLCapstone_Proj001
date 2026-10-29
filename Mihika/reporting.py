@@ -41,11 +41,12 @@ class Results:
     meta: dict  # horizon key -> meta.json contents
     flags: pd.DataFrame = field(default_factory=pd.DataFrame)  # out-of-sample flag per test row
     flag_diag: pd.DataFrame = field(default_factory=pd.DataFrame)  # per-fold flag diagnostics
+    anomaly_flags: pd.DataFrame = field(default_factory=pd.DataFrame)  # out-of-sample anomaly score/flag per row
 
 
 def load_results(output_dir: str | Path) -> Results:
     root = Path(output_dir)
-    metrics, preds, abl, meta, flags, fdiag = [], [], [], {}, [], []
+    metrics, preds, abl, meta, flags, fdiag, aflags = [], [], [], {}, [], [], []
     for d in sorted(p for p in root.iterdir() if (p / "meta.json").exists()):
         meta[d.name] = json.loads((d / "meta.json").read_text())
         metrics.append(pd.read_csv(d / "metrics.csv"))
@@ -55,10 +56,12 @@ def load_results(output_dir: str | Path) -> Results:
         if (d / "flags.parquet").exists():
             flags.append(pd.read_parquet(d / "flags.parquet"))
             fdiag.append(pd.read_csv(d / "flag_diagnostics.csv"))
+        if (d / "anomaly_flags.parquet").exists():
+            aflags.append(pd.read_parquet(d / "anomaly_flags.parquet"))
     if not metrics:
         raise FileNotFoundError(f"No completed horizons found under {root}")
     cat = lambda xs: pd.concat(xs, ignore_index=True) if xs else pd.DataFrame()
-    return Results(cat(metrics), cat(preds), cat(abl), meta, cat(flags), cat(fdiag))
+    return Results(cat(metrics), cat(preds), cat(abl), meta, cat(flags), cat(fdiag), cat(aflags))
 
 
 def _horizons(df: pd.DataFrame) -> list[str]:
@@ -446,3 +449,64 @@ def intraday_table(res: Results) -> pd.DataFrame:
     out = pd.DataFrame(rows)
     out["Horizon"] = pd.Categorical(out["Horizon"], HORIZON_ORDER, ordered=True)
     return out.sort_values(["Horizon"]).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------- anomaly score in the forecasts
+
+ANOMALY_USES = [
+    # (use, base model, model with the anomaly score; "{w}" = sig / free)
+    ("feature", "HAR-RV-L", "HAR-RV-L + anomaly [{w}]"),
+    ("feature", "Ridge | signature", "Ridge | signature + anomaly [{w}]"),
+    ("residual", "HAR-RV-L", "HAR-RV-L + anomaly residual [{w}]"),
+    ("gating", "HAR-RV-L", "HAR-RV-L | anomaly-gated [{w}]"),
+]
+
+
+def anomaly_effect_table(res: Results) -> pd.DataFrame:
+    """Does the anomaly score improve the forecasts, and is the signature detector better than the
+    best signature-free one?
+
+    For each use (feature / residual / gating) and detector (sig / free): pooled RMSE of the base model
+    and of the same model with the anomaly score, % change (positive = better), RMSE on rows the detector
+    flags vs the rest, and a Diebold-Mariano test against the base. "Sig vs free" compares the two
+    anomaly versions directly (positive = the signature detector's version is better)."""
+    if res.anomaly_flags.empty:
+        raise ValueError("No anomaly results; run the *_i horizons with use_anomaly=True")
+    rows = []
+    for hk, meta in res.meta.items():
+        label = HORIZON_LABELS[hk]
+        p = res.predictions[res.predictions.Horizon == label]
+        if p.empty:
+            continue
+        pred = p.pivot(index="Time", columns="Model", values="Prediction").sort_index()
+        actual = p.drop_duplicates("Time").set_index("Time")["Actual"].sort_index().loc[pred.index]
+        err = pred.rsub(actual, axis=0)
+        af = res.anomaly_flags[res.anomaly_flags.Horizon == label]
+        rm = lambda e, m: float(np.sqrt((e[m] ** 2).mean())) if m.any() else np.nan
+        for use, base, tmpl in ANOMALY_USES:
+            new = {w: tmpl.format(w=w) for w in ("sig", "free")}
+            if base not in err or any(n not in err for n in new.values()):
+                continue
+            for w, name in new.items():
+                flag = af[af.Which == w].set_index("Time")["flag"].reindex(pred.index).fillna(0).to_numpy() == 1
+                allr = np.ones(len(err), bool)
+                dm, pv = diebold_mariano(err[name].to_numpy(), err[base].to_numpy(), meta["horizon_rows"])
+                row = {"Horizon": label, "Use": use, "Base": base, "Detector": ANOMALY_LABEL[w], "N_flagged": int(flag.sum())}
+                for tag, m in (("all", allr), ("flagged", flag), ("unflagged", ~flag)):
+                    b, n = rm(err[base], m), rm(err[name], m)
+                    row[f"Pct_{tag}"] = 100 * (1 - n / b) if b else np.nan
+                row["RMSE_base"], row["RMSE_with"] = rm(err[base], allr), rm(err[name], allr)
+                row["DM_p_vs_base"] = pv
+                if w == "sig":
+                    dm2, pv2 = diebold_mariano(err[new["sig"]].to_numpy(), err[new["free"]].to_numpy(), meta["horizon_rows"])
+                    row["Pct_sig_vs_free"] = 100 * (1 - rm(err[new["sig"]], allr) / rm(err[new["free"]], allr))
+                    row["DM_p_sig_vs_free"] = pv2
+                rows.append(row)
+    out = pd.DataFrame(rows)
+    if out.empty:
+        raise ValueError("No anomaly model pairs found in these results")
+    out["Horizon"] = pd.Categorical(out["Horizon"], HORIZON_ORDER, ordered=True)
+    return out.sort_values(["Horizon", "Use", "Base", "Detector"]).reset_index(drop=True)
+
+
+ANOMALY_LABEL = {"sig": "signature", "free": "signature-free"}

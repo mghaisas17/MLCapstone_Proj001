@@ -6,6 +6,10 @@ mahalanobis  distance from the training mean under a Ledoit-Wolf covariance. On 
 iforest      Isolation Forest: unusual points are isolated by fewer random splits.
 autoencoder  small MLP that compresses and reconstructs the features; score = reconstruction
              error. Early stopping on the last 20% of the training rows.
+hmm          features -> PCA (fit on training rows) -> 3-state Gaussian HMM fit on the training
+             rows in time order; score = -log p(x_t | x_1..x_{t-1}) from the causal forward
+             filter, i.e. how unexpected a window is given the regime the model believes it is in.
+             Rows must be passed in time order (they are: folds are contiguous blocks).
 
 All standardize features with statistics from the training rows only.
 """
@@ -100,6 +104,26 @@ class AutoEncoder(_Scaled):
             return ((self.net(Z) - Z) ** 2).mean(dim=1).numpy()
 
 
+class HMM(_Scaled):
+    def __init__(self, n_states: int = 3, n_components: int = 5, seed: int = 0):
+        self.n_states, self.n_components, self.seed = n_states, n_components, seed
+
+    def fit(self, X):
+        from sklearn.decomposition import PCA
+        from anomaly_flag import DiagGaussianHMM
+
+        Z = self._fit_scaler(X)
+        self.pca = PCA(n_components=min(self.n_components, Z.shape[1]), random_state=self.seed).fit(Z)
+        P = self.pca.transform(Z)
+        self.p_scale = P.std(axis=0) + 1e-9
+        self.hmm = DiagGaussianHMM(self.n_states, seed=self.seed).fit(P / self.p_scale, restarts=3)
+        return self
+
+    def score(self, X):
+        P = self.pca.transform(self._t(X)) / self.p_scale
+        return -self.hmm.predictive_loglik(np.clip(P, -20, 20))
+
+
 def make(name: str, cfg) -> object:
     if name == "mahalanobis":
         return Mahalanobis()
@@ -107,4 +131,7 @@ def make(name: str, cfg) -> object:
         return IForest(seed=cfg.seed)
     if name == "autoencoder":
         return AutoEncoder(epochs=cfg.ae_epochs, patience=cfg.ae_patience, seed=cfg.seed)
+    if name == "hmm":
+        return HMM(n_states=getattr(cfg, "hmm_states", 3), n_components=getattr(cfg, "hmm_components", 5),
+                   seed=cfg.seed)
     raise ValueError(f"unknown detector {name!r}")

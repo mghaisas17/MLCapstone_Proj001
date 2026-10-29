@@ -4,13 +4,17 @@ Per horizon:
   Stage A  Mahalanobis + Isolation Forest on every path recipe: signatures at each depth, the
            matched lag bank, stats and raw, plus two volatility baselines (current vol level,
            HAR-RV forecast).
-  Stage B  the autoencoder on the top Stage A signature configs and the best of each control.
+  Stage B  the autoencoder and the HMM on the top Stage A signature configs and the best of
+           each control.
   Select   best signature config and best signature-free config by mean stratified surprise AUC
            on the first folds; confirm on the last fold.
   Gate     passes if the signature config beats the signature-free one on the last fold
            (block bootstrap, one-sided p < 0.05) as well as on the selection folds.
   Synthetic  order-only injected anomalies (same returns, different shape): can each selected
            detector find them?
+
+Finished horizons (meta.json present) are skipped, never re-run; add_detector() adds a detector
+to a finished horizon without re-running it.
 
 Results: <output_dir>/<horizon>/{metrics.csv, scores.parquet, selection.json, meta.json}; finished
 path recipes are saved under parts/ so an interrupted run resumes where it stopped.
@@ -168,62 +172,56 @@ def synthetic_check(choice: dict, bars, rows, folds, spec, cfg) -> dict:
     return {"AUC_injected": float(roc_auc_score(injected, model.score(Xs)))}
 
 
-def run_horizon(hk: str, cfg: AnomalyConfig) -> Path:
+BLOCK_DAYS = {"1h": 1, "1d": 10, "7d": 20}  # bootstrap block length (labels overlap for longer horizons)
+
+
+def _prepare(hk: str, cfg: AnomalyConfig, until=None):
+    """Bars, rows, folds and labels for a horizon. ``until`` truncates rows to a previous run's
+    last row time, so a finished horizon can be extended (add_detector) on identical rows."""
     spec = HORIZONS[hk]
-    out = Path(cfg.output_dir) / hk
-    if cfg.resume and (out / "meta.json").exists():
-        LOGGER.info("[%s] already complete, skipping", hk)
-        return out
-    out.mkdir(parents=True, exist_ok=True)
-    t0 = time.time()
     bars = load_bars(spec, cfg)
     max_w = int(round(spec.window * max(cfg.window_mults)))
     rows = build_rows(bars, spec, max_w, cfg.target_rows.get(hk))
+    if until is not None:
+        keep = np.asarray(rows.times <= pd.Timestamp(until))
+        rows = replace(rows, pos=rows.pos[keep], times=rows.times[keep], target_end=rows.target_end[keep],
+                       y=rows.y[keep], har_X=rows.har_X[keep])
     folds = purged_walk_forward(rows.times, rows.target_end, cfg.n_folds, cfg.min_train_rows)
     labels = {f.number: fold_labels(rows, f, cfg.surprise_quantile) for f in folds}
-    LOGGER.info("[%s] %d rows, folds %s", hk, len(rows.y), [(len(f.train), len(f.test)) for f in folds])
+    return spec, bars, rows, folds, labels
 
-    m_all, s_all = _baselines(rows, folds, labels, cfg)
-    metrics, scores = [pd.DataFrame(m_all)], [pd.concat(s_all, ignore_index=True)]
-    done: set = set()
-    for i, rep in enumerate(cfg.rep_configs(), 1):  # Stage A
-        LOGGER.info("[%s] stage A %d/%d: %s", hk, i, len(cfg.rep_configs()), rep.name)
-        m, s = _run_rep(rep, cfg.stage_a_detectors, bars, rows, folds, labels, spec, cfg, out, done)
-        metrics.append(m)
-        scores.append(s)
-    stage_a = pd.concat(metrics, ignore_index=True)
 
-    # Stage B: autoencoder on the top signature configs and the best config of each control kind
-    ranked = _selection_score(stage_a, folds[-1].number)
-    picks = list(ranked[ranked.Kind == SIGNATURE].Config.drop_duplicates().head(cfg.stage_b_top_k))
-    for kind in ("lag bank", "stats", "raw"):
-        best = ranked[ranked.Kind == kind].Config.head(1).tolist()
-        picks += best
-    for key in dict.fromkeys(picks):
+def _stage_b(hk, detectors_, ranked, bars, rows, folds, labels, spec, cfg, out, keys=None):
+    """The expensive detectors on the top signature configs and the best config of each control kind."""
+    if keys is None:
+        keys = list(ranked[ranked.Kind == SIGNATURE].Config.drop_duplicates().head(cfg.stage_b_top_k))
+        for kind in ("lag bank", "stats", "raw"):
+            keys += ranked[ranked.Kind == kind].Config.head(1).tolist()
+    metrics, scores = [], []
+    for key in dict.fromkeys(keys):
         rep = _rep_of_key(key, cfg)
-        LOGGER.info("[%s] stage B autoencoder: %s", hk, key)
-        m, s = _run_rep(rep, ("autoencoder",), bars, rows, folds, labels, spec, cfg, out, set(), only={key})
+        LOGGER.info("[%s] stage B %s: %s", hk, "+".join(detectors_), key)
+        m, s = _run_rep(rep, tuple(detectors_), bars, rows, folds, labels, spec, cfg, out, set(), only={key})
         metrics.append(m)
         scores.append(s)
-    metrics_df = pd.concat(metrics, ignore_index=True)
-    scores_df = pd.concat(scores, ignore_index=True)
+    return metrics, scores
 
-    # Selection, gate, synthetic check
+
+def _select_gate_write(hk, metrics_df, scores_df, bars, rows, folds, labels, spec, cfg, out, meta_extra):
     last = folds[-1].number
     ranked = _selection_score(metrics_df, last)
     best_sig = ranked[ranked.Kind == SIGNATURE].iloc[0].to_dict()
     best_non = ranked[ranked.Kind != SIGNATURE].iloc[0].to_dict()
-    lab = labels[last]
 
     def last_scores(choice):
         s = scores_df[(scores_df.Config == choice["Config"]) & (scores_df.Detector == choice["Detector"])
                       & (scores_df.Fold == last)]
-        return s.Score.to_numpy(float)
+        return s.sort_values("Time").Score.to_numpy(float)
 
-    spacing = (
-        pd.Series(rows.times).diff().median())
-    block = max(1, int(round(pd.Timedelta(days=10 if hk == "1d" else 1) / spacing)))  # ~1 day (1h), ~10 days (1d)
-    boot = block_bootstrap_diff(last_scores(best_sig), last_scores(best_non), lab, block, cfg.n_bootstrap, cfg.seed)
+    spacing = pd.Series(rows.times).diff().median()
+    block = max(1, int(round(pd.Timedelta(days=BLOCK_DAYS.get(hk, 10)) / spacing)))
+    boot = block_bootstrap_diff(last_scores(best_sig), last_scores(best_non), labels[last], block,
+                                cfg.n_bootstrap, cfg.seed)
     passed = bool(best_sig["Select"] > best_non["Select"] and boot["diff"] > 0 and boot["p_value"] < 0.05)
     synthetic = {}
     for label_, choice in (("best signature", best_sig), ("best signature-free", best_non)):
@@ -239,10 +237,73 @@ def run_horizon(hk: str, cfg: AnomalyConfig) -> Path:
     scores_df.to_parquet(out / "scores.parquet", index=False)
     (out / "selection.json").write_text(json.dumps(selection, indent=2, default=float))
     meta = {"horizon": hk, "rows": int(len(rows.y)), "folds": [[len(f.train), len(f.test)] for f in folds],
-            "first_time": str(rows.times[0]), "last_time": str(rows.times[-1]),
-            "seconds": round(time.time() - t0, 1)}
+            "first_time": str(rows.times[0]), "last_time": str(rows.times[-1]), **meta_extra}
     (out / "meta.json").write_text(json.dumps(meta, indent=2))  # written last = complete
+
+
+def run_horizon(hk: str, cfg: AnomalyConfig) -> Path:
+    out = Path(cfg.output_dir) / hk
+    if cfg.resume and (out / "meta.json").exists():
+        LOGGER.info("[%s] already complete, skipping (not re-run)", hk)
+        return out
+    out.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    spec, bars, rows, folds, labels = _prepare(hk, cfg)
+    LOGGER.info("[%s] %d rows, folds %s", hk, len(rows.y), [(len(f.train), len(f.test)) for f in folds])
+
+    m_all, s_all = _baselines(rows, folds, labels, cfg)
+    metrics, scores = [pd.DataFrame(m_all)], [pd.concat(s_all, ignore_index=True)]
+    done: set = set()
+    for i, rep in enumerate(cfg.rep_configs(), 1):  # Stage A
+        LOGGER.info("[%s] stage A %d/%d: %s", hk, i, len(cfg.rep_configs()), rep.name)
+        m, s = _run_rep(rep, cfg.stage_a_detectors, bars, rows, folds, labels, spec, cfg, out, done)
+        metrics.append(m)
+        scores.append(s)
+    ranked = _selection_score(pd.concat(metrics, ignore_index=True), folds[-1].number)
+    m_b, s_b = _stage_b(hk, cfg.stage_b_detectors, ranked, bars, rows, folds, labels, spec, cfg, out)
+    metrics_df = pd.concat(metrics + m_b, ignore_index=True)
+    scores_df = pd.concat(scores + s_b, ignore_index=True)
+    _select_gate_write(hk, metrics_df, scores_df, bars, rows, folds, labels, spec, cfg, out,
+                       {"seconds": round(time.time() - t0, 1)})
     return out
+
+
+def add_detector(cfg: AnomalyConfig, hk: str, detector: str = "hmm") -> Path:
+    """Add one Stage B detector to a horizon that has already finished, without re-running it.
+
+    Only the new detector is computed, on the same Stage B configs the horizon used (those the
+    autoencoder ran on) and on identical rows (truncated to the original run's last row); then
+    selection, the gate and the synthetic check are redone with the extra results."""
+    out = Path(cfg.output_dir) / hk
+    meta = json.loads((out / "meta.json").read_text())
+    metrics_df = pd.read_csv(out / "metrics.csv")
+    if detector in set(metrics_df.Detector):
+        LOGGER.info("[%s] %s already present, nothing to do", hk, detector)
+        return out
+    spec, bars, rows, folds, labels = _prepare(hk, cfg, until=meta["last_time"])
+    sizes = [[len(f.train), len(f.test)] for f in folds]
+    if sizes != meta["folds"] or str(rows.times[0]) != meta["first_time"]:
+        raise RuntimeError(f"[{hk}] cannot reproduce the original rows/folds ({sizes} vs {meta['folds']}); "
+                           "not adding to avoid mixing different rows")
+    keys = list(metrics_df[metrics_df.Detector == "autoencoder"].Config.drop_duplicates())
+    m_b, s_b = _stage_b(hk, (detector,), None, bars, rows, folds, labels, spec, cfg, out, keys=keys)
+    metrics_df = pd.concat([metrics_df] + m_b, ignore_index=True)
+    scores_df = pd.concat([pd.read_parquet(out / "scores.parquet")] + s_b, ignore_index=True)
+    extra = {k: v for k, v in meta.items() if k not in ("horizon", "rows", "folds", "first_time", "last_time")}
+    extra["added_detectors"] = sorted(set(extra.get("added_detectors", [])) | {detector})
+    _select_gate_write(hk, metrics_df, scores_df, bars, rows, folds, labels, spec, cfg, out, extra)
+    write_best_configs(Path(cfg.output_dir))
+    return out
+
+
+def write_best_configs(root: Path) -> None:
+    """best_configs.json from every finished horizon in the output folder (not just this run's)."""
+    best = {}
+    for hk in HORIZONS:
+        f = root / hk / "selection.json"
+        if (root / hk / "meta.json").exists() and f.exists():
+            best[hk] = json.loads(f.read_text())
+    (root / "best_configs.json").write_text(json.dumps(best, indent=2, default=float))
 
 
 def run_all(cfg: AnomalyConfig, subprocess_per_horizon: bool = False) -> Path:
@@ -258,12 +319,7 @@ def run_all(cfg: AnomalyConfig, subprocess_per_horizon: bool = False) -> Path:
                 LOGGER.error("[%s] exited with code %s; re-run to resume", hk, code)
         else:
             run_horizon(hk, cfg)
-    best = {}
-    for hk in cfg.horizons:
-        f = root / hk / "selection.json"
-        if f.exists():
-            best[hk] = json.loads(f.read_text())
-    (root / "best_configs.json").write_text(json.dumps(best, indent=2, default=float))
+    write_best_configs(root)
     return root
 
 

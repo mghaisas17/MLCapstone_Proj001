@@ -22,6 +22,7 @@ class HorizonSpec:
 HORIZONS = {
     "1h": HorizonSpec("1h", "1 hour", "5min", 288, "1h", "1h", ("1h", "1D", "7D"), 96),
     "1d": HorizonSpec("1d", "1 day", "1h", 168, "1D", "1D", ("1D", "7D", "30D"), 96),
+    "7d": HorizonSpec("7d", "7 day", "1h", 720, "7D", "1D", ("1D", "7D", "30D"), 96),
 }
 
 CHANNEL_SETS = {
@@ -56,13 +57,13 @@ class RepConfig:
 
 @dataclass
 class AnomalyConfig:
-    horizons: tuple = ("1h", "1d")
+    horizons: tuple = ("1h", "1d", "7d")  # finished horizons are skipped (resume), not re-run
     n_folds: int = 3
     min_train_rows: int = 200
     start: str = "2017-08-01"
     end: str | None = None  # None -> today
     symbol: str = "BTCUSDT"
-    target_rows: dict = field(default_factory=lambda: {"1h": 20000, "1d": None})
+    target_rows: dict = field(default_factory=lambda: {"1h": 20000, "1d": None, "7d": None})
 
     # Stage A grid (cheap detectors)
     channel_sets: tuple = tuple(CHANNEL_SETS)
@@ -72,8 +73,11 @@ class AnomalyConfig:
     depths: tuple = (2, 3, 4)
     max_sig_features: int = 3000  # skip depths whose signature is longer than this
     stage_a_detectors: tuple = ("mahalanobis", "iforest")
-    # Stage B: autoencoder on the top configs (+ controls)
+    # Stage B: the expensive detectors on the top configs (+ the best of each control)
     stage_b_top_k: int = 5
+    stage_b_detectors: tuple = ("autoencoder", "hmm")
+    hmm_states: int = 3
+    hmm_components: int = 5
     ae_epochs: int = 60
     ae_patience: int = 8
 
@@ -95,7 +99,7 @@ class AnomalyConfig:
     def quick(self) -> "AnomalyConfig":
         """Small grid on recent data, to check that everything runs."""
         return replace(
-            self, start="2023-01-01", target_rows={"1h": 3000, "1d": None},
+            self, start="2023-01-01", target_rows={"1h": 3000, "1d": None, "7d": None},
             channel_sets=("price", "price+volume+range+flow"), window_mults=(1.0,), lead_lag=(True,),
             depths=(2, 3), stage_b_top_k=2, ae_epochs=15, n_bootstrap=100,
             output_dir=self.output_dir + "_quick",
@@ -109,6 +113,7 @@ class AnomalyConfig:
     def from_json(cls, path) -> "AnomalyConfig":
         d = json.loads(Path(path).read_text())
         for k in ("horizons", "channel_sets", "normalizations", "window_mults", "lead_lag", "depths",
-                  "stage_a_detectors"):
-            d[k] = tuple(d[k])
+                  "stage_a_detectors", "stage_b_detectors"):
+            if k in d:  # older config.json files lack newer fields; the defaults apply
+                d[k] = tuple(d[k])
         return cls(**d)

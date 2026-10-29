@@ -300,6 +300,65 @@ def test_intraday_pipeline(tmp):
     ok("intraday-path horizons: same rows for every model, new models + controls run, comparison table")
 
 
+def test_anomaly_vol(tmp):
+    """Anomaly scores from the anomaly/ study used in the vol forecasts on the *_i horizons."""
+    import json
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from anomaly.config import AnomalyConfig
+
+    hourly, daily = hourly_and_daily(400)
+    ex.load_or_download_yahoo = lambda *a, **k: daily
+    ex.fetch_binance_klines_hourly = lambda *a, **k: hourly
+    adir = tmp / "anomaly_results"
+    adir.mkdir(parents=True, exist_ok=True)
+    AnomalyConfig(data_dir=str(tmp / "data")).to_json(adir / "config.json")
+    sel = {  # one signature + one stats detector for 1d; the HMM + a vol baseline for 7d
+        "1d": {"best_signature": {"Config": "signature d3 | price|none|w1|time", "Kind": "signature", "Detector": "mahalanobis"},
+               "best_signature_free": {"Config": "stats | trailing_vol|w1", "Kind": "stats", "Detector": "iforest"}},
+        "7d": {"best_signature": {"Config": "signature d2 | price|trailing_vol|w0.5|leadlag", "Kind": "signature", "Detector": "hmm"},
+               "best_signature_free": {"Config": "HAR forecast", "Kind": "baseline", "Detector": "none"}},
+    }
+    (adir / "best_configs.json").write_text(json.dumps(sel))
+    names = ex.anomaly_model_names()
+    assert len(names) == 8
+    cfg = ex.ExperimentConfig(
+        horizons=("1d_i", "7d_i"), models=("Mean", "HAR-RV-L", "Ridge | signature", *names),
+        use_anomaly=True, anomaly_selection=str(adir / "best_configs.json"), use_flag=False, run_ablations=False,
+        torch_epochs=2, target_rows={}, spec_overrides={k: {"intraday_path_points": 24} for k in ("1d_i", "7d_i")},
+        data_dir=str(tmp / "data"), cache_dir=str(tmp / "cache"), output_dir=str(tmp / "results_anomaly_vol"),
+    )
+    root = ex.run_all(cfg)
+    res = rp.load_results(root)
+    for hk in ("1d_i", "7d_i"):
+        got = set(res.metrics[res.metrics.HorizonKey == hk].Model)
+        assert set(names) <= got, set(names) - got
+    assert np.isfinite(res.metrics.RMSE).all()
+    assert set(res.anomaly_flags.Which) == {"sig", "free"} and res.anomaly_flags.flag.isin([0.0, 1.0]).all()
+    eff = rp.anomaly_effect_table(res)
+    assert len(eff) == 2 * 4 * 2, len(eff)
+    assert eff.Pct_sig_vs_free.notna().sum() == 2 * 4
+    ok("anomaly score in the forecasts: feature / residual / gating x signature / signature-free, effect table")
+
+    # no look-ahead: changing hourly bars after T leaves earlier rows' anomaly scores unchanged
+    spec = ex.base_spec_for("1d_i", daily, cfg)
+    ds = ex.get_dataset(daily, spec, cfg, include_seq=False, sub_window="5D", intraday=hourly)
+    folds = ex.purged_walk_forward(ds.times, ds.target_end, cfg.n_folds, cfg.min_train_rows)
+    fold = folds[-1]
+    T = ds.times[fold.test[len(fold.test) // 2]]
+    base = ex.FoldContext(ds, fold, "1d_i", 1, cfg, None, None, spec, {}).anomaly_cols("sig")
+    tampered = hourly.copy()
+    cols = ["open", "high", "low", "close"]
+    tampered.loc[tampered.index > T, cols] *= 3.0
+    ex.fetch_binance_klines_hourly = lambda *a, **k: tampered
+    alt = ex.FoldContext(ds, fold, "1d_i", 1, cfg, None, None, spec, {}).anomaly_cols("sig")
+    known = ds.times + pd.Timedelta("1D")
+    past = np.asarray(known <= T)
+    assert np.allclose(base[past, 0], alt[past, 0]), "anomaly score uses bars after the row's known time"
+    assert not np.allclose(base[~past, 0], alt[~past, 0])
+    ex.fetch_binance_klines_hourly = lambda *a, **k: hourly
+    ok("anomaly scores in the forecasts use no bars after each row's known time")
+
+
 # ---------------------------------------------------------------- synthetic bars
 def synth_bars(n, freq, binance):
     idx = pd.date_range("2024-01-01", periods=n, freq=freq, tz="UTC")
@@ -349,7 +408,7 @@ def test_pipeline(tmp):
         assert garch == set(ex.DAILY_HORIZONS) & set(ex.MAIN_HORIZONS), (g, garch)
     assert np.isfinite(res.metrics.RMSE).all()
     for m, spec in ex.MODELS.items():
-        if not spec.needs_intraday:  # intraday-path models run only on the *_i horizons
+        if not (spec.needs_intraday or spec.needs_anomaly):  # these run only on the *_i horizons
             assert m in set(res.metrics.Model), m
     assert not any(ex.MODELS[m].needs_intraday for m in set(res.metrics.Model))
     assert {"Signature level", "Augmentation", "Dimensions"} <= set(res.ablations.Experiment)
@@ -450,4 +509,5 @@ if __name__ == "__main__":
         test_controls_and_tuning()
         test_pipeline(tmp)
         test_intraday_pipeline(tmp)
+        test_anomaly_vol(tmp)
     print("\nALL SMOKE CHECKS PASSED")
