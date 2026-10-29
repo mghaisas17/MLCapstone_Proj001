@@ -45,6 +45,90 @@ horizons:
     depth: 4
     channels: [time, log_return, volume, log_range, overnight_gap]
 
+  # --- Short horizons (5-min / 1-hour / 1-day), all derived from the same
+  # underlying Binance 1-minute klines via resample_klines, so any difference
+  # between them is genuinely about the horizon, not the data source. Window
+  # length follows the "next-horizon-up" convention: 5-min bars in a 1-hour
+  # window, 1-hour bars in a 1-day window, 1-day bars in a ~1-week window --
+  # each deliberately distinct from macro (30-day) and intraday (48-hour).
+  # Each has a coarse-step sibling (`_scoring`, step=1) for the live series,
+  # same calibrate-coarse/score-fine split as macro/macro_daily. overnight_gap
+  # is dropped for 5-min/1-hour: consecutive bars in a continuous 24/7 market
+  # essentially never have a real gap at that resolution, unlike daily bars.
+  # recency_halflife_bars is scaled to macro's own validated half-life/window
+  # ratio (8 days / 30-day window = 0.267), expressed in EACH horizon's own
+  # bar units -- apply_recency_weights counts in bars, not calendar time, so
+  # reusing the raw number "8" unscaled meant 40 minutes of real decay for
+  # five_min (far too sharp relative to its 1-hour window) and longer-than-
+  # the-whole-window for one_day (next to no decay at all). This fixes that.
+  five_min:
+    # NOTE: two volume-channel fixes were tried and both made things worse
+    # (log_volume: 3.3%->83.6%; log_volume_change: 3.3%->11.0%) -- raw volume
+    # confirmed best. A window(12/24) x depth(2/3/4) sweep then found DEPTH,
+    # not window length, is the dominant lever: depth=4 overfits noise at
+    # this resolution (6mo flag rate 5.3%), depth=2 overcorrects into
+    # under-triggering (0.10%), depth=3 is the sweet spot (0.66%, closest to
+    # the 1% target of anything tried). Window length alone had a much
+    # smaller effect than depth at any fixed depth.
+    description: "5-minute bars, 1-hour window (calibration step)"
+    source: binance_klines_1m
+    resample: 5min
+    window: 12
+    step: 4
+    depth: 3
+    channels: [time, log_return, volume, log_range]
+    recency_halflife_bars: 3   # 15 min, ratio 3/12 = 0.25
+
+  five_min_scoring:
+    description: "5-minute bars, 1-hour window, scored every bar"
+    source: binance_klines_1m
+    resample: 5min
+    window: 12
+    step: 1
+    depth: 3
+    channels: [time, log_return, volume, log_range]
+    recency_halflife_bars: 3
+
+  one_hour:
+    description: "1-hour bars, 1-day window (calibration step)"
+    source: binance_klines_1m
+    resample: 1h
+    window: 24
+    step: 8
+    depth: 4
+    channels: [time, log_return, log_volume, log_range]
+    recency_halflife_bars: 6   # 6 hours, ratio 6/24 = 0.25
+
+  one_hour_scoring:
+    description: "1-hour bars, 1-day window, scored every bar"
+    source: binance_klines_1m
+    resample: 1h
+    window: 24
+    step: 1
+    depth: 4
+    channels: [time, log_return, log_volume, log_range]
+    recency_halflife_bars: 6
+
+  one_day:
+    description: "1-day bars, ~1-week window (calibration step)"
+    source: binance_klines_1m
+    resample: 1D
+    window: 7
+    step: 2
+    depth: 4
+    channels: [time, log_return, volume, log_range, overnight_gap]
+    recency_halflife_bars: 2   # 2 days, ratio 2/7 = 0.286 (closest integer)
+
+  one_day_scoring:
+    description: "1-day bars, ~1-week window, scored every bar"
+    source: binance_klines_1m
+    resample: 1D
+    window: 7
+    step: 1
+    depth: 4
+    channels: [time, log_return, volume, log_range, overnight_gap]
+    recency_halflife_bars: 2
+
 # Half-life (in days) for apply_recency_weights: how quickly an increment's
 # influence on a window's signature decays as it ages within the window.
 # Tunable; 7-10 days was the agreed range, 8 is the midpoint default.
@@ -89,6 +173,30 @@ tick_reference_period:
 intraday_reference_period:
   start: "2023-10-01"
   end: "2023-12-15"
+
+# The 5 pre-2017 entries in `reference_periods` above predate Binance's
+# launch and can't be used for Binance-sourced horizons -- these are the
+# other 8, reused as-is so "normal" is defined identically to macro wherever
+# Binance actually has data, rather than each short horizon inventing its
+# own reference period.
+short_horizon_reference_periods:
+  - {start: "2018-08-13", end: "2018-11-18"}
+  - {start: "2019-01-17", end: "2019-04-01"}
+  - {start: "2020-06-04", end: "2020-11-25"}
+  - {start: "2024-04-09", end: "2024-08-07"}
+  - {start: "2024-08-28", end: "2024-11-10"}
+  - {start: "2024-11-30", end: "2025-03-02"}
+  - {start: "2025-04-26", end: "2026-02-04"}
+  - {start: "2026-02-26", end: "2026-09-03"}
+
+# Continuous block used to SCORE the short horizons uniformly -- not
+# restricted to the 5 labeled macro events, so genuine anomalies anywhere in
+# this window (not just inside a named crisis) can be found. Also happens to
+# contain 5 of the 8 calm periods above (2024-2026), pulled once as one
+# continuous fetch rather than as separate islands.
+short_horizon_scoring_period:
+  start: "2023-09-25"
+  end: "2026-09-25"
 
 events:
   covid_crash:

@@ -22,6 +22,7 @@ pyarrow
 pyod        # ~10+ outlier-detection algorithms in one package, incl. ECOD (distribution-free, robust to heavy tails)
 stumpy      # matrix profile / discord detection, per-day-native
 ruptures    # changepoint detection
+arch        # GARCH(1,1) baseline -- classical, non-signature volatility forecast comparator
 
 # hmmlearn requires compiling a pybind11 C++ extension, which fails on this
 # machine for the same reason iisignature does above (broken Xcode Command

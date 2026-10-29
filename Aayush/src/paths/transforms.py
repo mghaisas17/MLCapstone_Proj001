@@ -43,6 +43,36 @@ def extract_channels(window_data: pd.DataFrame, channels: list[str], source: str
             cols["log_return"] = np.cumsum(log_ret)
         if "volume" in channels:
             cols["volume"] = window_data["volume"].to_numpy(dtype=float)
+        if "log_volume" in channels:
+            # At fine (5-min/1-hour) resolution, raw volume is extremely
+            # heavy-tailed (empirically: skew ~7.7, kurtosis ~121, max/median
+            # ~97x at 5-min) -- a handful of large-but-ordinary trades landing
+            # in one bar can dominate the normalization and the signature
+            # distance, independent of whether price did anything unusual.
+            # log-transforming compresses that tail. Kept as a separate
+            # channel name (not a change to `volume` itself) so macro/daily
+            # horizons, already validated on raw volume, are unaffected.
+            vol = window_data["volume"].to_numpy(dtype=float)
+            cols["log_volume"] = np.log1p(vol)
+        if "log_volume_change" in channels:
+            # `volume`/`log_volume` above are *absolute per-bar levels* --
+            # unlike `log_return`, which is deliberately zeroed to a
+            # cumulative change from the window's own start so windows from
+            # different eras are comparable. BTC's typical trading volume has
+            # grown secularly over the years, so an absolute-level volume
+            # channel makes windows from a low-volume era look permanently
+            # "shifted" relative to a reference fit on a different era --
+            # log-compressing the level (`log_volume`) made this *worse*, not
+            # better, empirically (5-min flag rate 3.3% -> 83.6%), consistent
+            # with the shift becoming relatively larger once compressed.
+            # This channel instead mirrors log_return's own construction:
+            # cumulative log-ratio of volume from the window's own first bar,
+            # so only the *shape* of volume within the window matters, never
+            # its absolute era-dependent level.
+            vol = window_data["volume"].to_numpy(dtype=float)
+            log_vol = np.log1p(vol)
+            log_vol_diff = np.diff(log_vol, prepend=log_vol[0])
+            cols["log_volume_change"] = np.cumsum(log_vol_diff)
         if "log_range" in channels:
             # Intraday/interday dispersion (Parkinson-style realized-range
             # proxy) that close-to-close log_return misses entirely -- a bar
