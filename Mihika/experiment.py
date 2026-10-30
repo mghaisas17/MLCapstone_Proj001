@@ -22,6 +22,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import subprocess
 import sys
 import time
@@ -578,7 +579,9 @@ def _har_anomaly_residual(which):
         base = predict_har_log(har, d.X_har, har.resid, c.horizon_steps)
         cols = c.anomaly_cols(which)
         Z = np.column_stack([cols, cols[:, 0] * np.log(base)])
-        resid = np.log(np.maximum(d.y, EPS)) - np.log(base)
+        # a window that only rises has drawdown 0; log(0) would be an extreme outlier (vol is never 0)
+        y = np.where(d.y > 0, d.y, d.y[tr][d.y[tr] > 0].min())
+        resid = np.log(y) - np.log(base)
         model = fit_ridge(Z[tr], resid[tr], d.times[tr], d.target_end[tr])
         smear = float(np.mean(np.exp(resid[tr] - model.predict(Z[tr]))))
         return base[te] * np.exp(model.predict(Z[te])) * smear
@@ -1093,15 +1096,28 @@ def run_all(cfg: ExperimentConfig, *, subprocess_per_horizon: bool = False) -> P
     cannot take down a notebook kernel; finished horizons are skipped on re-run."""
     root = Path(cfg.output_dir)
     cfg.to_json(root / "config.json")
+    # PyTorch and XGBoost each ship an OpenMP runtime; on macOS two copies in one process can
+    # segfault (exit code -11). One OpenMP thread per process avoids the clash (the models already
+    # run single-threaded), and faulthandler prints the Python line if a native crash still happens.
+    env = {**os.environ, "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "1"),
+           "KMP_DUPLICATE_LIB_OK": "TRUE"}
+    failed = {}
     for horizon in cfg.horizons:
         if not subprocess_per_horizon:
             run_horizon(horizon, cfg)
             continue
-        cmd = [sys.executable, str(Path(__file__).resolve()), "--config", str(root / "config.json"),
-               "--horizons", horizon]
-        code = subprocess.run(cmd).returncode
+        cmd = [sys.executable, "-X", "faulthandler", str(Path(__file__).resolve()),
+               "--config", str(root / "config.json"), "--horizons", horizon]
+        code = subprocess.run(cmd, env=env).returncode
         if code != 0:
             LOGGER.error("[%s] subprocess exited with code %s; re-run to resume", horizon, code)
+            failed[horizon] = code
+    if failed:
+        crash = " (negative = killed by a signal; -11 is a segfault in native code, -9 usually out of memory)"
+        raise RuntimeError(
+            f"Horizon(s) failed: {failed}{crash}. The error is in the output above; finished horizons "
+            "are kept and skipped on re-run."
+        )
     return root
 
 
