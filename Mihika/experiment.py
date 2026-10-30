@@ -45,6 +45,7 @@ from forecast_data import (
     duration_steps,
     fetch_binance_bars,
     fetch_binance_klines_hourly,
+    future_drawdown_targets,
     load_or_download_yahoo,
 )
 from models_and_metrics import (
@@ -112,6 +113,12 @@ class ExperimentConfig:
     target_rows: dict = field(
         default_factory=lambda: {"5m": 4000, "1h": 4000, "1d": None, "7d": None, "30d": None}
     )
+
+    # What is forecast: "vol" (realized volatility, the default), "drawdown" (max drawdown of the log
+    # price over the horizon, from hourly closes) or "drawdown_ratio" (that drawdown / the realized
+    # volatility of the same window: the shape of the path with its scale removed). The drawdown
+    # targets need the hourly bars, so they run on the *_i horizons only.
+    target: str = "vol"
 
     # models
     models: tuple | None = None  # None -> every registered model valid for the horizon
@@ -363,6 +370,8 @@ class ModelSpec:
     needs_flag: bool = False  # uses the HMM anomaly flag
     needs_intraday: bool = False  # uses intraday-path features (only the *_i horizons have them)
     needs_anomaly: bool = False  # uses the anomaly score (use_anomaly, *_i horizons in best_configs.json)
+    vol_only: bool = False  # forecasts volatility by construction (GARCH), so skipped for other targets
+    default: bool = True  # included when cfg.models is None
 
 
 def _mean(c):
@@ -633,8 +642,8 @@ MODELS: dict[str, ModelSpec] = {
     for m in [
         ModelSpec("Mean", _mean),
         ModelSpec("HAR-RV-L", _har),
-        ModelSpec("GARCH(1,1) | fixed", _garch, horizons=DAILY_HORIZONS),
-        ModelSpec("GARCH(1,1) | rolling refit", _garch_rolling, horizons=DAILY_HORIZONS),
+        ModelSpec("GARCH(1,1) | fixed", _garch, horizons=DAILY_HORIZONS, vol_only=True),
+        ModelSpec("GARCH(1,1) | rolling refit", _garch_rolling, horizons=DAILY_HORIZONS, vol_only=True),
         ModelSpec("Ridge | stats", _ridge("stats")),
         ModelSpec("Ridge | signature", _ridge("sig")),
         # controls: same Ridge, signature-free features (see forecast_data.lag_bank_features)
@@ -653,6 +662,13 @@ MODELS: dict[str, ModelSpec] = {
         ModelSpec("Ridge | intraday multiscale stats", _ridge("imulti"), needs_intraday=True),
         ModelSpec("Ridge | intraday signature + HAR-RV", _ridge("isig+harrv"), needs_intraday=True),
         ModelSpec("HAR-RV-L calibrated", _har_calibrated),
+        # nonlinear learners on signatures vs on the matched lag bank (used by the drawdown runs;
+        # not part of the default vol model list)
+        *[ModelSpec(f"{label} | {name}", fn(kind), needs_intraday=kind.startswith("i"), default=False)
+          for label, fn in (("XGBoost", _xgb), ("MLP", _mlp))
+          for kind, name in (("sig", "signature"), ("lag", "lag bank (matched)"),
+                             ("isig", "intraday signature"), ("ilag", "intraday lag bank (matched)"))
+          if (label, kind) != ("XGBoost", "sig")],  # that one is already in the default list
         # anomaly score from the anomaly/ study (signature vs signature-free detector)
         *[ModelSpec(f"{label} [{w}]", fn(w), needs_anomaly=True)
           for w in ANOMALY_VARIANTS
@@ -666,6 +682,19 @@ MODELS: dict[str, ModelSpec] = {
         ModelSpec("Ridge | signature + stress dim", _ridge_stress_dim, needs_flag=True),
     ]
 }
+
+
+# The drawdown runs: baselines, signature vs signature-free features under three learners, and the
+# anomaly score used as in the vol forecasts (see experiment notebook, "Drawdown").
+DRAWDOWN_MODELS = (
+    "Mean", "HAR-RV-L", "HAR-RV-L calibrated", "HAR-RV-L (intraday RV)",
+    "Ridge | stats", "Ridge | signature", "Ridge | lag bank (matched)",
+    "Ridge | intraday signature", "Ridge | intraday lag bank (matched)", "Ridge | intraday multiscale stats",
+    "XGBoost | signature", "XGBoost | lag bank (matched)", "MLP | signature", "MLP | lag bank (matched)",
+    "XGBoost | intraday signature", "XGBoost | intraday lag bank (matched)",
+    "MLP | intraday signature", "MLP | intraday lag bank (matched)",
+)
+TARGETS = ("vol", "drawdown", "drawdown_ratio")
 
 
 def rmse(y, p) -> float:
@@ -703,6 +732,8 @@ def evaluate_models(
             if model.needs_intraday and ds.X_isig is None:
                 continue  # intraday models need intraday features (only the *_i horizons have them)
             if model.needs_anomaly and not anomaly_ok:
+                continue
+            if model.vol_only and cfg.target != "vol":
                 continue
             t0 = time.time()
             pred = np.maximum(np.asarray(model.fit_predict(ctx), dtype=float), EPS)
@@ -847,6 +878,40 @@ def get_dataset(
     return ds
 
 
+def subset_dataset(ds: ForecastDataset, keep: np.ndarray) -> ForecastDataset:
+    """The same dataset restricted to the rows in ``keep`` (a boolean mask)."""
+    n = len(ds.y)
+    changes = {
+        k: (v[keep] if isinstance(v, (np.ndarray, pd.Index)) and len(v) == n else v)
+        for k, v in vars(ds).items() if k not in ("har_names", "stat_names")
+    }
+    return replace(ds, **changes)
+
+
+def with_target(ds: ForecastDataset, target: str, intraday: pd.DataFrame, spec: ForecastSpec,
+                horizon_steps: int) -> ForecastDataset:
+    """Swap the forecast target. Every model fits either ``y`` (Ridge, XGBoost, MLP) or ``y_har_log``
+    (the HAR family, which back-transforms with sqrt(exp(.) * h)), so setting
+    ``y_har_log = log(y^2 / h)`` makes the HAR family forecast the new target on its own scale with
+    no model changes. Rows and ``target_end`` are unchanged (minus rows whose future window has
+    missing hourly bars), so the purge is unchanged too."""
+    if target == "vol":
+        return ds
+    if target not in TARGETS:
+        raise ValueError(f"Unknown target {target!r}; choose from {TARGETS}")
+    if intraday is None:
+        raise ValueError(f"The {target} target needs hourly bars; run it on the *_i horizons.")
+    known = ds.times + pd.Timedelta(spec.bar_freq)
+    dd, ratio = future_drawdown_targets(intraday, known, spec.horizon, spec.intraday_freq or "1h")
+    y = dd if target == "drawdown" else ratio
+    keep = np.isfinite(y)
+    if (~keep).any():
+        LOGGER.info("[%s] dropping %d rows without a complete future window", target, int((~keep).sum()))
+    ds, y = subset_dataset(ds, keep), y[keep]
+    floor = float(np.quantile(y[y > 0], 0.01))  # a flat or monotone window has drawdown 0; keep log finite
+    return replace(ds, y=y, y_har_log=np.log(np.maximum(y, floor) ** 2 / horizon_steps))
+
+
 # --------------------------------------------------------------------------
 # Ablations: which signature construction choices matter (same folds)
 # --------------------------------------------------------------------------
@@ -966,15 +1031,18 @@ def run_horizon(horizon: str, cfg: ExperimentConfig) -> Path:
     intraday = load_intraday(cfg) if horizon in INTRADAY_PATH_HORIZONS else None
     use_flag = cfg.use_flag and intraday is None  # the flag study is on the main horizons
     use_anomaly = anomaly_available(cfg, horizon)
+    if cfg.target != "vol":
+        use_flag = False  # the HMM flag marks the high-volatility state; not studied for drawdown
     names = list(cfg.models) if cfg.models else [
         n for n, m in MODELS.items()
-        if (use_flag or not m.needs_flag) and (intraday is not None or not m.needs_intraday)
-        and (use_anomaly or not m.needs_anomaly)
+        if m.default and (use_flag or not m.needs_flag) and (intraday is not None or not m.needs_intraday)
+        and (use_anomaly or not m.needs_anomaly) and (cfg.target == "vol" or not m.vol_only)
     ]
     need_seq = any(MODELS[n].needs_seq for n in names)
 
     ds = get_dataset(bars, spec, cfg, include_seq=need_seq, sub_window=per_horizon(cfg.lstm_sub_window, horizon),
                      intraday=intraday)
+    ds = with_target(ds, cfg.target, intraday, spec, horizon_steps)
     folds = purged_walk_forward(ds.times, ds.target_end, cfg.n_folds, cfg.min_train_rows)
     returns = np.log(bars["close"]).diff().dropna() if horizon in DAILY_HORIZONS else None
     LOGGER.info(
@@ -986,6 +1054,7 @@ def run_horizon(horizon: str, cfg: ExperimentConfig) -> Path:
     metrics, preds = evaluate_models(
         ds, folds, horizon, horizon_steps, cfg, names, returns=returns,
         bars=bars if use_flag else None, spec=spec, flag_cache=flag_cache,
+        experiment="Main" if cfg.target == "vol" else cfg.target,
     )
     metrics.to_csv(out / "metrics.csv", index=False)
     preds.to_parquet(out / "predictions.parquet", index=False)
@@ -997,7 +1066,7 @@ def run_horizon(horizon: str, cfg: ExperimentConfig) -> Path:
         flags.to_parquet(out / "flags.parquet", index=False)
         flag_diag.to_csv(out / "flag_diagnostics.csv", index=False)
 
-    if cfg.run_ablations and intraday is None:
+    if cfg.run_ablations and intraday is None and cfg.target == "vol":
         ablations = run_ablations(bars, spec, ds, folds, horizon, horizon_steps, cfg, returns)
         ablations.to_csv(out / "ablations.csv", index=False)
 
@@ -1009,6 +1078,7 @@ def run_horizon(horizon: str, cfg: ExperimentConfig) -> Path:
         "fold_sizes": [[len(f.train), len(f.test)] for f in folds],
         "first_time": str(ds.times[0]), "last_time": str(ds.times[-1]),
         "intraday_paths": intraday is not None,
+        "target": cfg.target,
         "seconds": round(time.time() - t0, 1),
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=2))  # written last = "complete"

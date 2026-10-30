@@ -365,6 +365,112 @@ def test_anomaly_vol(tmp):
     ok("anomaly scores in the forecasts use no bars after each row's known time")
 
 
+# ---------------------------------------------------------------- drawdown targets
+def test_drawdown_math():
+    from forecast_data import future_drawdown_targets
+
+    t = pd.date_range("2025-01-01", periods=60, freq="1h", tz="UTC")
+    known = [t[10]]  # path = close of bar t[9], then the bars labelled t[10] .. t[33] (one day)
+
+    def run(rets):
+        lp = np.zeros(len(t))
+        lp[10:10 + len(rets)] = np.cumsum(rets)
+        lp[10 + len(rets):] = lp[9 + len(rets)]
+        return [v[0] for v in future_drawdown_targets(pd.DataFrame({"close": np.exp(lp)}, index=t), known, "1D")]
+
+    alt = [0.02, -0.02] * 12  # up, down, up, down
+    grouped = [0.02] * 12 + [-0.02] * 12  # same returns, re-ordered: one long slide
+    dd_a, r_a = run(alt)
+    dd_g, r_g = run(grouped)
+    assert np.isclose(dd_a, 0.02) and np.isclose(dd_g, 0.24), (dd_a, dd_g)
+    assert np.isclose(dd_a / r_a, dd_g / r_g), "same returns must give the same realized vol"
+    assert r_g > 10 * r_a
+    dd_up, _ = run([0.01] * 24)
+    assert dd_up == 0
+    dd_v, _ = run([-0.05] * 12 + [0.05] * 12)  # V shape: falls straight from the start price
+    assert np.isclose(dd_v, 0.6)
+    # only bars inside (known, known + 1 day] matter
+    lp = np.cumsum(np.random.default_rng(0).normal(0, 0.01, len(t)))
+    frame = pd.DataFrame({"close": np.exp(lp)}, index=t)
+    base = future_drawdown_targets(frame, known, "1D")[0][0]
+    outside = frame.copy()
+    outside.iloc[:9, 0] *= 2  # before the start price
+    outside.iloc[34:, 0] *= 0.5  # after the window
+    assert np.isclose(future_drawdown_targets(outside, known, "1D")[0][0], base)
+    inside = frame.copy()
+    inside.iloc[20, 0] *= 0.5
+    assert not np.isclose(future_drawdown_targets(inside, known, "1D")[0][0], base)
+    gap = frame.drop(frame.index[12:20])  # missing bars inside the window -> no target
+    assert np.isnan(future_drawdown_targets(gap, known, "1D")[0][0])
+    ok("drawdown target: known values, order matters at equal vol, no bars outside the window used")
+
+
+def test_drawdown_pipeline(tmp):
+    """Both drawdown targets on the *_i horizons, with the anomaly models (needs test_anomaly_vol's files)."""
+    hourly, daily = hourly_and_daily(400)
+    ex.load_or_download_yahoo = lambda *a, **k: daily
+    ex.fetch_binance_klines_hourly = lambda *a, **k: hourly
+    names = ex.anomaly_model_names()
+    models = (*ex.DRAWDOWN_MODELS, *names, "GARCH(1,1) | rolling refit")
+    results = {}
+    for target in ("drawdown", "drawdown_ratio"):
+        cfg = ex.ExperimentConfig(
+            horizons=("1d_i", "7d_i"), target=target, models=models, use_anomaly=True,
+            anomaly_selection=str(tmp / "anomaly_results" / "best_configs.json"), use_flag=False,
+            run_ablations=False, torch_epochs=2, xgb_estimators=10, target_rows={},
+            spec_overrides={k: {"intraday_path_points": 24} for k in ("1d_i", "7d_i")},
+            data_dir=str(tmp / "data"), cache_dir=str(tmp / "cache"), output_dir=str(tmp / "results_dd" / target),
+        )
+        res = rp.load_results(ex.run_all(cfg))
+        results[target] = res
+        assert all(m["target"] == target for m in res.meta.values())
+        got = set(res.metrics.Model)
+        assert "GARCH(1,1) | rolling refit" not in got, "GARCH forecasts vol; it must be skipped"
+        assert got == set(models) - {"GARCH(1,1) | rolling refit"}, set(models) ^ got
+        assert np.isfinite(res.predictions.Prediction).all() and (res.predictions.Prediction > 0).all()
+        assert (res.predictions.Actual >= 0).all() and set(res.metrics.Experiment) == {target}
+        hk_rmse = res.metrics.groupby(["HorizonKey", "Model"]).RMSE.mean()
+        for hk in ("1d_i", "7d_i"):
+            assert hk_rmse[(hk, "HAR-RV-L")] < 2 * hk_rmse[(hk, "Mean")], "HAR on the swapped target is off-scale"
+        st = rp.shape_table(res)
+        assert {"Ridge | signature", "XGBoost | intraday signature"} <= set(st.Model) and np.isfinite(st.Pct_better).all()
+        auc = rp.anomaly_auc_table(res)
+        assert set(auc.Detector) == {"signature", "signature-free"} and auc.AUC_score.between(0, 1).all()
+        assert len(rp.anomaly_effect_table(res))
+    # same rows and folds as the vol run of the same horizons, minus rows without a full future window
+    vol = rp.load_results(tmp / "results_anomaly_vol")
+    for hk in ("1d_i", "7d_i"):
+        t_vol = set(vol.predictions[vol.predictions.HorizonKey == hk].Time)
+        t_dd = set(results["drawdown"].predictions[results["drawdown"].predictions.HorizonKey == hk].Time)
+        assert t_dd <= t_vol and len(t_dd) >= 0.95 * len(t_vol)
+    ok("drawdown targets: vol-only models skipped, HAR family on the new scale, shape + anomaly AUC tables")
+    return results
+
+
+def test_interpretation_figures(tmp, dd_results):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    vol = rp.load_results(tmp / "results_anomaly_vol")
+    intr = rp.load_results(tmp / "results_intraday")
+    figs = [
+        rp.plot_skill(intr), rp.plot_pair_skill(intr, [(m, v) for m, vs in rp.INTRADAY_COMPARISONS for v in vs]),
+        rp.plot_calibration(vol), rp.plot_error_over_time(intr, ["Ridge | intraday signature"], window=40),
+        rp.plot_anomaly_response(vol), rp.plot_anomaly_timeline(vol), rp.plot_learner_grid(intr),
+    ]
+    for res in dd_results.values():
+        figs += [rp.plot_skill(res, ref="HAR-RV-L calibrated"), rp.plot_learner_grid(res),
+                 rp.plot_pair_skill(res, [(m, v) for m, vs in rp.SHAPE_COMPARISONS for v in vs]),
+                 rp.plot_calibration(res), rp.plot_anomaly_response(res), rp.plot_predictions(res)]
+    for k, fig in enumerate(figs):
+        fig.savefig(tmp / f"interp_{k}.png", dpi=30)
+        plt.close(fig)
+    lo, hi = rp._bootstrap_pct(np.ones(500), 2 * np.ones(500), block=20, n_boot=50)
+    assert np.isclose(lo, 50) and np.isclose(hi, 50)
+    ok(f"interpretation figures render ({len(figs)} figures, vol + drawdown results)")
+
+
 def test_download_retry():
     import requests, time as _time
 
@@ -460,8 +566,10 @@ def test_pipeline(tmp):
         assert garch == set(ex.DAILY_HORIZONS) & set(ex.MAIN_HORIZONS), (g, garch)
     assert np.isfinite(res.metrics.RMSE).all()
     for m, spec in ex.MODELS.items():
-        if not (spec.needs_intraday or spec.needs_anomaly):  # these run only on the *_i horizons
+        if spec.default and not (spec.needs_intraday or spec.needs_anomaly):  # these run only on the *_i horizons
             assert m in set(res.metrics.Model), m
+        if not spec.default:
+            assert m not in set(res.metrics.Model), f"{m} is opt-in and must not join the default vol list"
     assert not any(ex.MODELS[m].needs_intraday for m in set(res.metrics.Model))
     assert {"Signature level", "Augmentation", "Dimensions"} <= set(res.ablations.Experiment)
     flag_models = {n for n, m in ex.MODELS.items() if m.needs_flag}
@@ -563,4 +671,7 @@ if __name__ == "__main__":
         test_pipeline(tmp)
         test_intraday_pipeline(tmp)
         test_anomaly_vol(tmp)
+        test_drawdown_math()
+        dd = test_drawdown_pipeline(tmp)
+        test_interpretation_figures(tmp, dd)
     print("\nALL SMOKE CHECKS PASSED")

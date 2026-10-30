@@ -719,6 +719,35 @@ def har_log_target(bars: pd.DataFrame, i: int, horizon_steps: int) -> float:
     return float(np.log(max(future_mean_var, 0.0) + EPS))
 
 
+def future_drawdown_targets(
+    intraday: pd.DataFrame, known_times, horizon: str, freq: str = "1h", min_coverage: float = 0.9,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Max drawdown of the log price over (known, known + horizon], from intraday closes, and that
+    drawdown divided by the realized volatility of the same window.
+
+    The path starts at the close of the last bar completed at the known time, so a fall straight
+    from that price counts. Bars are labelled by their open time. A row whose window is missing
+    more than ``1 - min_coverage`` of its bars gets NaN for both."""
+    labels = _ns(intraday.index)
+    known = _ns(known_times)
+    step = np.timedelta64(int(pd.Timedelta(freq).value), "ns")
+    span = np.timedelta64(int(pd.Timedelta(horizon).value), "ns")
+    j0 = np.searchsorted(labels, known, side="left")  # first bar after the known time
+    j1 = np.searchsorted(labels, known + span, side="left")  # first bar after the window
+    expected = int(pd.Timedelta(horizon) / pd.Timedelta(freq))
+    log_close = np.log(intraday["close"].to_numpy(float))
+    dd, ratio = np.full(len(known), np.nan), np.full(len(known), np.nan)
+    for k in range(len(known)):
+        a, b = int(j0[k]), int(j1[k])
+        if a < 1 or labels[a - 1] != known[k] - step or b - a < min_coverage * expected:
+            continue
+        path = log_close[a - 1 : b]
+        dd[k] = float(np.max(np.maximum.accumulate(path) - path))
+        rv = float(np.sqrt(np.sum(np.diff(path) ** 2)))
+        ratio[k] = dd[k] / rv if rv > 0 else np.nan
+    return dd, ratio
+
+
 def duration_steps(duration: str, bar_freq: str) -> int:
     duration_td = pd.Timedelta(duration)
     bar_td = pd.Timedelta(bar_freq)
