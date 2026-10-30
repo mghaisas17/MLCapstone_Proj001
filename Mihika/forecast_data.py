@@ -1179,19 +1179,36 @@ def _klines_to_hourly(df: pd.DataFrame, freq: str = "1h") -> pd.DataFrame:
     )
 
 
-def _download_klines(url: str, timeout: int = 120) -> pd.DataFrame:
+def _download_klines(url: str, timeout: int = 120, attempts: int = 5) -> pd.DataFrame:
+    """Download and read one klines zip. Transient network failures (timeouts, dropped connections,
+    truncated archives) are retried with exponential backoff (2, 4, 8, 16 s); a missing file
+    (HTTP 404) is not retried and raises FileNotFoundError."""
     import tempfile
+    import time
 
-    with tempfile.TemporaryFile() as tmp:
-        with requests.get(url, timeout=timeout, stream=True) as response:
-            if response.status_code != 200:
-                raise FileNotFoundError(f"Binance klines unavailable: {url} (HTTP {response.status_code})")
-            for block in response.iter_content(chunk_size=1 << 20):
-                tmp.write(block)
-        tmp.seek(0)
-        with zipfile.ZipFile(tmp) as zf:
-            with zf.open(zf.namelist()[0]) as handle:
-                return pd.read_csv(handle, header=None, names=KLINE_COLUMNS, usecols=range(11), dtype=str)
+    for attempt in range(1, attempts + 1):
+        try:
+            with tempfile.TemporaryFile() as tmp:
+                with requests.get(url, timeout=timeout, stream=True) as response:
+                    if response.status_code == 404:
+                        raise FileNotFoundError(f"Binance klines unavailable: {url} (HTTP 404)")
+                    if response.status_code >= 400:  # e.g. 5xx from the archive: transient, retried
+                        raise requests.exceptions.HTTPError(f"HTTP {response.status_code} for {url}")
+                    for block in response.iter_content(chunk_size=1 << 20):
+                        tmp.write(block)
+                tmp.seek(0)
+                with zipfile.ZipFile(tmp) as zf:
+                    with zf.open(zf.namelist()[0]) as handle:
+                        return pd.read_csv(handle, header=None, names=KLINE_COLUMNS, usecols=range(11), dtype=str)
+        except FileNotFoundError:
+            raise
+        except (requests.exceptions.RequestException, zipfile.BadZipFile, OSError) as exc:
+            if attempt == attempts:
+                raise
+            wait = 2**attempt
+            LOGGER.warning("Download failed (%s), retrying in %ds [%d/%d]: %s", type(exc).__name__, wait,
+                           attempt, attempts - 1, url)
+            time.sleep(wait)
 
 
 def fetch_binance_klines_hourly(

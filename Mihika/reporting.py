@@ -458,6 +458,8 @@ ANOMALY_USES = [
     ("feature", "HAR-RV-L", "HAR-RV-L + anomaly [{w}]"),
     ("feature", "Ridge | signature", "Ridge | signature + anomaly [{w}]"),
     ("residual", "HAR-RV-L", "HAR-RV-L + anomaly residual [{w}]"),
+    # the decisive test: does the score add anything beyond fixing HAR's average bias?
+    ("residual vs calibrated", "HAR-RV-L calibrated", "HAR-RV-L + anomaly residual [{w}]"),
     ("gating", "HAR-RV-L", "HAR-RV-L | anomaly-gated [{w}]"),
 ]
 

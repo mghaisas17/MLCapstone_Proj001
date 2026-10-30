@@ -291,14 +291,20 @@ class FoldContext:
 
     # ---- anomaly score from the anomaly/ study, refit per fold on rows before the test block
     def anomaly_cols(self, which: str) -> np.ndarray:
-        """[score, flag] for every row; ``which`` is "sig" (best signature detector) or "free"
-        (best signature-free detector) from best_configs.json."""
+        """[score percentile, flag] for every row; ``which`` is "sig" (best signature detector) or
+        "free" (best signature-free detector) from best_configs.json.
+
+        Raw detector scores (distances, reconstruction errors) are unbounded with heavy tails, so
+        they are mapped to their percentile among this fold's training-row scores (0..1, test rows
+        beyond the training range clip to 0 or 1) before entering any model. The flag is
+        percentile >= 1 - anomaly_flag_rate."""
         key = ("anomaly", which, self.fold.number)
         if key not in self.flag_cache:
             self.flag_cache[key] = _anomaly_scores(self, which)
         score = self.flag_cache[key]
-        thr = np.quantile(score[self.fold.train], 1 - self.cfg.anomaly_flag_rate)
-        return np.column_stack([score, (score >= thr).astype(float)])
+        ref = np.sort(score[self.fold.train])
+        pct = np.searchsorted(ref, score, side="right") / len(ref)
+        return np.column_stack([pct, (pct >= 1 - self.cfg.anomaly_flag_rate).astype(float)])
 
     def stress_dataset(self) -> ForecastDataset:
         """Signature features with the stress probability added as a path dimension."""
@@ -571,6 +577,16 @@ def _har_anomaly_residual(which):
     return run
 
 
+def _har_calibrated(c):
+    """HAR-RV-L rescaled by its average error on the training rows: the anomaly-residual model with
+    no anomaly inputs. If an anomaly-residual model only matches this, its gain was calibration
+    (HAR-RV-L overshoots realized volatility), not information from the anomaly score."""
+    d, tr, te = c.ds, c.fold.train, c.fold.test
+    har = fit_har_log(d.X_har[tr], d.y_har_log[tr])
+    base = predict_har_log(har, d.X_har, har.resid, c.horizon_steps)
+    return base[te] * float(np.mean(np.maximum(d.y[tr], EPS) / base[tr]))
+
+
 def _har_anomaly_gated(which):
     """HAR-RV-L whose coefficients may differ when the anomaly flag is on (flag x HAR terms);
     plain HAR-RV-L if fewer than 30 training rows are flagged."""
@@ -636,6 +652,7 @@ MODELS: dict[str, ModelSpec] = {
         ModelSpec("Ridge | intraday lag bank (matched)", _ridge("ilag"), needs_intraday=True),
         ModelSpec("Ridge | intraday multiscale stats", _ridge("imulti"), needs_intraday=True),
         ModelSpec("Ridge | intraday signature + HAR-RV", _ridge("isig+harrv"), needs_intraday=True),
+        ModelSpec("HAR-RV-L calibrated", _har_calibrated),
         # anomaly score from the anomaly/ study (signature vs signature-free detector)
         *[ModelSpec(f"{label} [{w}]", fn(w), needs_anomaly=True)
           for w in ANOMALY_VARIANTS

@@ -548,12 +548,29 @@ against the original):
 - The likely reason is that the HMM sees return, range and trailing volatility,
   which HAR and Ridge already contain, so the flag mostly restates what they know.
 
+**How often does it fire correctly?** "Correct" = the flag is on and realized
+volatility over the horizon lands in the top 20% of the fold (base rate 20%).
+Pooled over folds, the flag's precision is 0.41–0.57 (lift 2.1–2.8×), but ranking
+rows by the HMM stress probability is *worse* than ranking them by the HAR
+forecast at every horizon:
+
+| Horizon | Share flagged | Precision | Recall | AUC flag | AUC HAR forecast |
+|---|---|---|---|---|---|
+| 5 min | 21% | 0.57 | 0.60 | 0.84 | 0.89 |
+| 1 hour | 25% | 0.45 | 0.55 | 0.77 | 0.85 |
+| 1 day | 19% | 0.50 | 0.47 | 0.76 | 0.79 |
+| 7 day | 19% | 0.47 | 0.44 | 0.73 | 0.77 |
+| 30 day | 19% | 0.41 | 0.39 | 0.69 | 0.71 |
+
+So the flag does point at high-volatility periods, but it knows less about them
+than HAR already does, which is why it adds nothing as a regressor.
+
 **Conclusion for the flag.** It is a reasonable descriptive regime indicator,
 and it gives no forecasting benefit at daily or longer horizons. Ways to make it
 carry new information would be to give the HMM inputs the forecasters do not
 use, or to use it for gating or risk decisions, not as an extra regressor.
 
-### 5.6 Intraday paths for the daily and weekly forecasts (implemented, not yet run)
+### 5.6 Intraday paths for the daily and weekly forecasts (30 days run; 1 and 7 days to re-run)
 
 **Why.** At 1, 7 and 30 days the signature is computed from only 30 daily points, and
 a flat lag bank on the same channels matched it (§5.3). Signatures should earn
@@ -586,7 +603,137 @@ same hourly window, and adds to the intraday-RV HAR. If the intraday-RV HAR alon
 closes most of the gap to Ridge, the earlier 8–13% gain over HAR was mostly the
 weakness of the daily-bar HAR.
 
-## 6. Cross-cutting issues and limitations
+**Status.** In the run, `1d_i` and `7d_i` stopped on Binance download timeouts (the
+klines loader had no retry; it now retries with backoff, and re-running resumes from
+the cache). `30d_i` completed.
+
+**30-day results** (pooled RMSE, % better = row model has lower RMSE, Diebold–Mariano p):
+
+| Model | vs | % better | p |
+|---|---|---|---|
+| Ridge, intraday signature | intraday lag bank (matched) | +8.9 | 0.001 |
+| Ridge, intraday signature | intraday multi-scale stats | −0.2 | 0.96 |
+| Ridge, intraday signature | daily-path signature | −0.3 | 0.89 |
+| Ridge, intraday signature | HAR-RV-L on intraday RV | +6.7 | 0.11 |
+| Ridge, intraday signature + HAR-RV | HAR-RV-L on intraday RV | +6.9 | 0.10 |
+| HAR-RV-L on intraday RV | HAR-RV-L (daily) | +5.1 | 0.03 |
+
+- With a 720-point hourly path the size-matched lag bank must discard far more, and
+  the signature beats it clearly. But hand-built multi-scale realized-variance
+  features from the same window do just as well, and the intraday path adds
+  nothing over the daily-path signature.
+- HAR on intraday realized variance is a better baseline than the daily HAR.
+- On the same post-2017 rows at 1 and 7 days (from the anomaly-vol run, fold-mean
+  RMSE vs daily HAR-RV-L): intraday-RV HAR is +5.2% (1 day) and +6.1% (7 days);
+  Ridge on the daily-path signature is +7.1% and +12.4%. The stronger HAR closes
+  most of Ridge's lead at 1 day and about half at 7 days.
+
+### 5.7 Which signature settings matter? (`spec_overrides` sweep)
+
+Ridge on signatures with one setting changed at a time, at 1 and 7 days, chosen on
+folds 1–2 and confirmed on fold 3 (% better than HAR-RV-L, fold-mean):
+
+| Variant | 1 day: folds 1–2 → fold 3 | 7 day: folds 1–2 → fold 3 |
+|---|---|---|
+| main (depth 3, lead-lag + time, full path, 30-day lookback) | 7.9 → 9.6 | 10.0 → 20.9 |
+| depth 4 | 8.2 → 10.7 | 9.2 → 22.1 |
+| depth 2 | 2.7 → 5.4 | 3.0 → 15.1 |
+| no lead-lag | 1.2 → 9.9 | 9.0 → 21.1 |
+| price + volume only (no range) | −3.1 → 6.1 | −20.0 → 16.2 |
+| 60-day lookback | 1.8 → 6.2 | 1.9 → 16.7 |
+
+The pre-declared main spec is at or near the best; depth 4 is marginally better at
+1 day (RMSE 0.0148 vs 0.0150) and equal at 7 days. Depth 2, a longer lookback and
+dropping the range channel all hurt, the last badly at 7 days. Choosing on folds 1–2
+and checking on fold 3 gives the same ranking, so the main results are not an
+artefact of the specification.
+
+## 6. Anomaly detection with path signatures, rebuilt (`anomaly/`)
+
+### 6.1 Why it was rebuilt
+Thread B's detector (distance of a window's signature from a "calm" average) was
+validated by forward-volatility lift, and on that test GARCH, a volatility z-score
+and Isolation Forest matched or beat it at every horizon (Aayush's own comparison,
+`Aayush/reports/short_horizons_all_methods_comparison.csv`). That test rewards
+volatility clustering. The rebuild asks a sharper question: do signature-based
+anomaly scores tell us anything *beyond* what a volatility model already knows?
+
+### 6.2 Design, in plain words
+- **Windows.** For each row, the latest window of Binance bars (2017 onward):
+  1 hour = 1 day of 5-minute bars; 1 day = 7 days of hourly bars; 7 days = 30
+  days of hourly bars. Window lengths of ½×, 1× and 2× are also tried.
+- **Path.** Cumulative return, volume share, range and signed flow, optionally
+  divided by the volatility measured *before* the window ("shape-only").
+- **Four representations of the same window.** Signature (depth 2–4, with or without
+  lead-lag), a lag bank with the same number of columns, hand-built stats, and raw
+  block sums. Two volatility baselines: current vol level and the HAR forecast.
+- **Detectors.** Mahalanobis (the expected-signature-distance idea), Isolation Forest,
+  autoencoder, and (7 days) an HMM, all fit on past rows only, with purged
+  walk-forward folds.
+- **Judged on vol surprise.** A "missed event" is one of the 20% of rows where
+  realized volatility most exceeded the HAR forecast. The main number is the AUC
+  of the anomaly score for predicting missed events, computed within calm, medium and
+  volatile buckets (0.5 = no information beyond HAR).
+- **Honest selection and a gate.** About 250 configs per horizon are ranked on
+  folds 1–2; the winner is judged on fold 3. Signatures "pass" only if the best
+  signature config also beats the best signature-free config on fold 3 (block
+  bootstrap, p < 0.05).
+
+### 6.3 Results
+
+| Horizon | Best signature: folds 1–2 → fold 3 | Best signature-free: folds 1–2 → fold 3 | Fold-3 difference (95% CI, p) | Gate |
+|---|---|---|---|---|
+| 1 hour | 0.556 → 0.545 (depth 4, price, Mahalanobis) | 0.547 → 0.526 (lag bank, Isolation Forest) | +0.019 (−0.005, 0.045), p = 0.06 | fail |
+| 1 day | 0.648 → 0.582 (depth 3, price, Mahalanobis) | 0.555 → 0.539 (stats, Isolation Forest) | +0.043 (−0.005, 0.104), p = 0.04 | barely pass |
+| 7 days | 0.594 → 0.500 (depth 4, price, HMM) | 0.576 → 0.564 (stats, Mahalanobis) | −0.064 (−0.19, 0.05), p = 0.84 | fail |
+
+- **No reliable signature advantage.** It fails at 1 hour and 7 days and passes
+  narrowly at 1 day, with a confidence interval that includes zero.
+- **Selection overfits.** At 7 days the signature configs that ranked best on
+  folds 1–2 fell to chance (0.45–0.50) on fold 3; the plain stats detector held up.
+- **The 1-day winner is simple and may be confounded.** It has 14 features from a
+  7-day price-only path, without vol normalization, so it largely encodes the week's
+  net move and its timing. The surprise labels used HAR without a leverage term, so
+  part of this is likely the leverage effect (falls → more volatility than HAR expects).
+- **What signatures can see in principle.** Re-ordering a window's returns into a V
+  shape (same volatility, net move, skew and kurtosis; only the order changes) is
+  detected with AUC 0.999–1.0 by the selected signature detectors, versus 0.60–0.89
+  for the signature-free ones. So signatures do see pure path shape; real BTC shapes
+  just don't predict volatility surprises much.
+
+### 6.4 The anomaly score in the volatility forecasts
+The selected signature and signature-free detectors were refit inside every vol fold
+and used, on the post-2017 rows at 1 and 7 days, as a feature, as a residual correction
+of HAR-RV-L (which already has a leverage term), and as a regime gate.
+
+**First run (v1).**
+- **Feature and gating: invalid.** The raw scores (unbounded distances) went straight
+  into HAR's regression and a few extreme values produced absurd forecasts (one
+  variant had 8× HAR's RMSE). The scores now enter as their percentile among the
+  fold's training scores; this needs re-running.
+- **Residual correction:** +6.1% (signature) and +8.2% (signature-free) vs HAR-RV-L at
+  1 day, +6.9% for both at 7 days, all highly significant. But three things point to
+  **calibration, not anomaly information**:
+  - signature and signature-free give the same gain (−2.3% at 1 day, p = 0.20;
+    0.0% at 7 days, p = 0.99);
+  - the gain sits on *unflagged* rows (for example 1 day, signature: +9.2% unflagged,
+    −43% on the 32 flagged rows);
+  - HAR-RV-L is known to overshoot realized volatility by about 20%, and the residual
+    model's intercept fixes that whatever the score says.
+- **Ridge on signatures + the score:** +1.4% (p = 0.13) at 1 day, −0.4% at 7 days.
+
+**Second run (v2, pending).** Percentile-scaled scores, plus a `HAR-RV-L calibrated`
+control (HAR rescaled by its average training error, i.e. the residual model with no
+anomaly input). The decisive comparison is anomaly-residual vs calibrated HAR.
+
+### 6.5 Conclusion so far
+Path-signature anomaly scores do not carry reliable information about volatility
+beyond what HAR already knows, at 1 hour, 1 day or 7 days. The one apparent gain in
+the forecasts behaves like a bias correction. Signatures *can* detect pure shape
+anomalies (the synthetic test), so the negative result is about what matters for BTC
+volatility, not about what signatures can represent.
+
+## 7. Cross-cutting issues and limitations
 
 - **Single asset.** Everything is BTC. There is no FX/equity test, although the
   original plan proposed EUR/USD and Dukascopy data.
@@ -603,13 +750,15 @@ weakness of the daily-bar HAR.
   1-hour results rest on 77 days; RMSE only, so crisis periods dominate; HAR
   and GARCH may be penalised by calibration (they overshoot realized volatility
   by 19–41%); depth 4 was never run. See §5.4.
-- **Unfinished.** Micro and intraday horizons are not evaluated. The summary
-  table has no rows for them. CVaR-OCSVM does not work on real data. P&L
-  evaluation (in the task plan) has not been started. The anomaly threads (B and C)
-  do not yet share a common evaluation, and no comparison of signature
-  anomaly scores against volatility-based scores has been run.
+- **Anomaly study (§6).** Selection over about 250 configs overfits (7 days); the
+  surprise labels used HAR without a leverage term; the anomaly-in-forecasts results
+  need the v2 re-run (scaled scores, calibrated-HAR control).
+- **Unfinished.** Thread B's micro and intraday horizons were never evaluated, and
+  CVaR-OCSVM does not work on real data. P&L evaluation (in the task plan) has not
+  been started. `1d_i` / `7d_i` (intraday paths) need re-running after a download
+  failure.
 
-## 7. Where things stand
+## 8. Where things stand
 
 | Question | Current answer |
 |---|---|
@@ -622,4 +771,7 @@ weakness of the daily-bar HAR.
 | Is Ridge better than nonlinear models? | No longer. With equal tuning, the LSTM and MLP tie Ridge at 1 and 7 days; Ridge still wins at 30 days. |
 | Is GARCH a fair baseline? | Rolling refit helps but GARCH (and HAR) still overshoot realized volatility by 19–41%. Part of the gap to Ridge may be calibration; a bias-corrected HAR/GARCH has not been tried. |
 | Does an HMM anomaly flag help volatility forecasts? | It identifies a stress regime (volatility 1.2–3.2× higher while flagged), but adds nothing at 1 day or longer; small gains at 1 hour only for models that still lose to HAR. As a path dimension it hurts at 7 and 30 days. |
+| Do signature anomaly scores carry information beyond volatility (rebuilt study, §6)? | No reliable evidence: the gate fails at 1 hour and 7 days and passes narrowly at 1 day (fold-3 CI includes zero, possibly the leverage effect). Signatures do detect pure-shape synthetic anomalies (AUC ≈ 1.0). |
+| Does the anomaly score improve volatility forecasts? | Not shown. The residual-correction gain (+6–8% vs HAR-RV-L) is equal for signature and signature-free detectors and sits on normal days, consistent with calibration; a re-run with a calibrated-HAR control is pending. |
+| Do intraday (hourly) paths make the signature more useful for daily-to-monthly forecasts? | At 30 days: the signature beats its matched lag bank (+8.9%, p = 0.001) but ties multi-scale realized-variance stats and the daily-path signature. HAR on intraday realized variance is a stronger baseline (+5% over daily HAR). 1 and 7 days to re-run. |
 | Paper's CVaR-OCSVM on market data? | Does not work as implemented |

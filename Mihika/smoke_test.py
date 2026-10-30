@@ -322,7 +322,7 @@ def test_anomaly_vol(tmp):
     names = ex.anomaly_model_names()
     assert len(names) == 8
     cfg = ex.ExperimentConfig(
-        horizons=("1d_i", "7d_i"), models=("Mean", "HAR-RV-L", "Ridge | signature", *names),
+        horizons=("1d_i", "7d_i"), models=("Mean", "HAR-RV-L", "HAR-RV-L calibrated", "Ridge | signature", *names),
         use_anomaly=True, anomaly_selection=str(adir / "best_configs.json"), use_flag=False, run_ablations=False,
         torch_epochs=2, target_rows={}, spec_overrides={k: {"intraday_path_points": 24} for k in ("1d_i", "7d_i")},
         data_dir=str(tmp / "data"), cache_dir=str(tmp / "cache"), output_dir=str(tmp / "results_anomaly_vol"),
@@ -334,9 +334,15 @@ def test_anomaly_vol(tmp):
         assert set(names) <= got, set(names) - got
     assert np.isfinite(res.metrics.RMSE).all()
     assert set(res.anomaly_flags.Which) == {"sig", "free"} and res.anomaly_flags.flag.isin([0.0, 1.0]).all()
+    assert res.anomaly_flags.score.between(0, 1).all(), "scores must be training-percentiles"
     eff = rp.anomaly_effect_table(res)
-    assert len(eff) == 2 * 4 * 2, len(eff)
-    assert eff.Pct_sig_vs_free.notna().sum() == 2 * 4
+    assert len(eff) == 2 * 5 * 2, len(eff)
+    assert eff.Pct_sig_vs_free.notna().sum() == 2 * 5
+    assert "residual vs calibrated" in set(eff.Use)
+    hk_rmse = res.metrics.groupby(["HorizonKey", "Model"]).RMSE.mean()
+    for hk in ("1d_i", "7d_i"):  # with percentile scores nothing should explode relative to HAR
+        worst = max(hk_rmse[(hk, n)] for n in names)
+        assert worst < 3 * hk_rmse[(hk, "HAR-RV-L")], (hk, worst)
     ok("anomaly score in the forecasts: feature / residual / gating x signature / signature-free, effect table")
 
     # no look-ahead: changing hourly bars after T leaves earlier rows' anomaly scores unchanged
@@ -357,6 +363,52 @@ def test_anomaly_vol(tmp):
     assert not np.allclose(base[~past, 0], alt[~past, 0])
     ex.fetch_binance_klines_hourly = lambda *a, **k: hourly
     ok("anomaly scores in the forecasts use no bars after each row's known time")
+
+
+def test_download_retry():
+    import requests, time as _time
+
+    calls = {"n": 0}
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("k.csv", "1700000000000,1,1,1,1,1,0,1,1,1,1,0\n")
+    content = buf.getvalue()
+
+    class Resp:
+        status_code = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def raise_for_status(self): pass
+        def iter_content(self, chunk_size): yield content
+
+    def flaky(url, **kw):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise requests.exceptions.ConnectionError("Read timed out.")
+        return Resp()
+
+    sleep, get = _time.sleep, fd.requests.get
+    _time.sleep = lambda s: None
+    try:
+        fd.requests.get = flaky
+        df = fd._download_klines("https://example/k.zip")
+        assert calls["n"] == 3 and len(df) == 1
+
+        class R404(Resp):
+            status_code = 404
+        calls["n"] = 0
+        def missing(url, **kw):
+            calls["n"] += 1
+            return R404()
+        fd.requests.get = missing
+        try:
+            fd._download_klines("https://example/missing.zip")
+            raise AssertionError("404 should raise")
+        except FileNotFoundError:
+            assert calls["n"] == 1, "a missing file must not be retried"
+    finally:
+        _time.sleep, fd.requests.get = sleep, get
+    ok("klines download retries transient failures, does not retry a missing file")
 
 
 # ---------------------------------------------------------------- synthetic bars
@@ -503,6 +555,7 @@ if __name__ == "__main__":
         test_to_ns()
         test_garch_rolling()
         test_flag_accuracy()
+        test_download_retry()
         test_loader(tmp)
         test_klines(tmp)
         test_intraday_no_lookahead()
