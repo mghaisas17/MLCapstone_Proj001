@@ -472,9 +472,15 @@ def test_interpretation_figures(tmp, dd_results):
 
 
 # ---------------------------------------------------------------- FX (asset="fx")
-def fx_hourly(n_weeks=60):
-    """Synthetic EUR/USD-like hourly bars on FX trading hours only (Sunday 22:00 to Friday 22:00 UTC)."""
-    h = synth_bars(24 * 7 * n_weeks, "1h", True)
+def fx_hourly(n_weeks=60, seed=11):
+    """Synthetic EUR/USD-like hourly bars on FX trading hours only (Sunday 22:00 to Friday 22:00 UTC).
+    Seeded, so the FX checks see the same series whichever tests ran before them."""
+    global rng
+    saved, rng = rng, np.random.default_rng(seed)
+    try:
+        h = synth_bars(24 * 7 * n_weeks, "1h", True)
+    finally:
+        rng = saved
     h = h[(h.index + pd.Timedelta(hours=2)).dayofweek < 5].copy()
     for c in ("open", "high", "low", "close"):
         h[c] *= 1.1 / 30_000
