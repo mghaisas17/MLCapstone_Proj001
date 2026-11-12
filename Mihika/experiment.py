@@ -39,6 +39,7 @@ from sklearn.preprocessing import StandardScaler
 
 from anomaly_flag import episodes, fit_flag, to_ns
 from forecast_data import (
+    FX_SPECS,
     SPECS,
     ForecastDataset,
     ForecastSpec,
@@ -46,7 +47,9 @@ from forecast_data import (
     duration_steps,
     fetch_binance_bars,
     fetch_binance_klines_hourly,
+    fetch_dukascopy_hourly,
     future_drawdown_targets,
+    fx_daily_from_hourly,
     load_or_download_yahoo,
 )
 from models_and_metrics import (
@@ -72,11 +75,15 @@ HORIZON_LABELS = {
     "5m": "5 min", "1h": "1 hour", "1d": "1 day", "7d": "7 day", "30d": "30 day",
     # same rows, target and baselines as the daily horizons, signature built from hourly paths
     "1d_i": "1 day (intraday paths)", "7d_i": "7 day (intraday paths)", "30d_i": "30 day (intraday paths)",
+    # FX (asset="fx"): windows and horizons in trading days
+    "5d": "5 day", "22d": "22 day", "5d_i": "5 day (intraday paths)", "22d_i": "22 day (intraday paths)",
 }
 BINANCE_HORIZONS = ("5m", "1h")
-INTRADAY_PATH_HORIZONS = ("1d_i", "7d_i", "30d_i")
-DAILY_HORIZONS = ("1d", "7d", "30d") + INTRADAY_PATH_HORIZONS
+INTRADAY_PATH_HORIZONS = ("1d_i", "7d_i", "30d_i", "5d_i", "22d_i")
+DAILY_HORIZONS = ("1d", "7d", "30d", "5d", "22d") + INTRADAY_PATH_HORIZONS
 MAIN_HORIZONS = ("5m", "1h", "1d", "7d", "30d")
+FX_MAIN_HORIZONS = ("1d", "5d", "22d")  # no tick-data horizons for FX in this pipeline
+ASSETS = ("crypto", "fx")
 
 
 def base_key(horizon: str) -> str:
@@ -95,6 +102,11 @@ def per_horizon(table: dict, horizon: str):
 
 @dataclass
 class ExperimentConfig:
+    # "crypto": BTC (Binance + Yahoo, the original study). "fx": an FX pair from Dukascopy hourly
+    # bars (daily bars built from them), with 1 / 5 / 22 trading-day windows and horizons.
+    asset: str = "crypto"
+    fx_symbol: str = "EURUSD"
+    fx_start: str = "2012-01-01"
     horizons: tuple = MAIN_HORIZONS
     n_folds: int = 3
     min_train_rows: int = 50
@@ -125,10 +137,10 @@ class ExperimentConfig:
     models: tuple | None = None  # None -> every registered model valid for the horizon
     torch_epochs: int = 200
     weight_decay: dict = field(
-        default_factory=lambda: {"5m": 1e-4, "1h": 1e-4, "1d": 1e-4, "7d": 5e-4, "30d": 1e-3}
+        default_factory=lambda: {"5m": 1e-4, "1h": 1e-4, "1d": 1e-4, "7d": 5e-4, "30d": 1e-3, "5d": 5e-4, "22d": 1e-3}
     )
     lstm_sub_window: dict = field(
-        default_factory=lambda: {"5m": "30min", "1h": "6h", "1d": "5D", "7d": "5D", "30d": "5D"}
+        default_factory=lambda: {"5m": "30min", "1h": "6h", "1d": "5D", "7d": "5D", "30d": "5D", "5d": "5D", "22d": "5D"}
     )
     xgb_estimators: int = 500  # max trees (early stopping picks the number when tuning)
     seed: int = 42
@@ -160,7 +172,7 @@ class ExperimentConfig:
     flag_threshold: float = 0.5  # flag = filtered P(stress state) >= threshold
     flag_restarts: int = 3
     flag_freq: dict = field(  # cadence of the HMM's observations
-        default_factory=lambda: {"5m": "15min", "1h": "1h", "1d": "1D", "7d": "1D", "30d": "1D"}
+        default_factory=lambda: {"5m": "15min", "1h": "1h", "1d": "1D", "7d": "1D", "30d": "1D", "5d": "1D", "22d": "1D"}
     )
 
     # io
@@ -503,13 +515,18 @@ def _anomaly_scores(ctx, which: str) -> np.ndarray:
     selection, acfg = _anomaly_settings(cfg)
     hk = base_key(ctx.horizon_key)
     choice = selection[hk]["best_signature" if which == "sig" else "best_signature_free"]
-    spec = AC.HORIZONS[hk]
+    if acfg.asset != cfg.asset:
+        raise ValueError(f"anomaly_selection is from an asset={acfg.asset!r} study but this run is asset={cfg.asset!r}")
+    spec = AC.horizon_specs(acfg.asset)[hk]
 
     cache_key = ("anomaly_rows", which)
     if cache_key not in ctx.flag_cache:
         end = acfg.end or cfg.intraday_end or cfg.yahoo_end or str(pd.Timestamp.now(tz="UTC").date())
-        bars = fetch_binance_klines_hourly(acfg.start, end, symbol=cfg.symbol,
-                                           data_dir=Path(acfg.data_dir) / "klines", freq=spec.bar_freq)
+        if acfg.asset == "fx":
+            bars = fetch_dukascopy_hourly(acfg.start, end, symbol=acfg.symbol, data_dir=Path(acfg.data_dir) / "dukascopy")
+        else:
+            bars = fetch_binance_klines_hourly(acfg.start, end, symbol=cfg.symbol,
+                                               data_dir=Path(acfg.data_dir) / "klines", freq=spec.bar_freq)
         known = ds.times + pd.Timedelta(ctx.spec.bar_freq)
         freq = pd.Timedelta(spec.bar_freq)
         pos = np.searchsorted(to_ns(bars.index), to_ns(known - freq), side="right") - 1  # last complete bar
@@ -771,6 +788,10 @@ _BINANCE_MEMO: dict = {}
 
 
 def load_bars(horizon: str, cfg: ExperimentConfig) -> pd.DataFrame:
+    if cfg.asset == "fx":  # daily FX bars are built from the same hourly bars as the paths
+        if horizon in BINANCE_HORIZONS:
+            raise ValueError("The 5 min / 1 hour horizons need tick data and are crypto-only here.")
+        return fx_daily_from_hourly(load_intraday(cfg))
     if horizon in BINANCE_HORIZONS:
         freqs = tuple(sorted({SPECS[h].bar_freq for h in BINANCE_HORIZONS}))
         key = (cfg.symbol, cfg.binance_start, cfg.binance_end, freqs)
@@ -792,8 +813,18 @@ _INTRADAY_MEMO: dict = {}
 
 
 def load_intraday(cfg: ExperimentConfig) -> pd.DataFrame:
-    """Hourly bars from Binance klines for the *_i horizons (cached per month on disk)."""
+    """Hourly bars for the *_i horizons (cached per month on disk): Binance klines for crypto,
+    Dukascopy for FX (where they are also the source of the daily bars)."""
     end = cfg.intraday_end or cfg.yahoo_end or str(pd.Timestamp.now(tz="UTC").date())
+    if cfg.asset == "fx":
+        key = ("fx", cfg.fx_symbol, cfg.fx_start, end)
+        if key not in _INTRADAY_MEMO:
+            _INTRADAY_MEMO.clear()
+            _INTRADAY_MEMO[key] = fetch_dukascopy_hourly(
+                cfg.fx_start, end, symbol=cfg.fx_symbol, data_dir=Path(cfg.data_dir) / "dukascopy",
+                force_download=cfg.force_download,
+            )
+        return _INTRADAY_MEMO[key]
     key = (cfg.symbol, cfg.intraday_start, end)
     if key not in _INTRADAY_MEMO:
         _INTRADAY_MEMO.clear()
@@ -816,8 +847,17 @@ def choose_stride(n_bars: int, spec: ForecastSpec, target_rows: int | None) -> i
     return max(1, math.ceil(candidates / target_rows))
 
 
+def specs_for(cfg: ExperimentConfig) -> dict:
+    if cfg.asset not in ASSETS:
+        raise ValueError(f"asset must be one of {ASSETS}, got {cfg.asset!r}")
+    return FX_SPECS if cfg.asset == "fx" else SPECS
+
+
 def base_spec_for(horizon: str, bars: pd.DataFrame, cfg: ExperimentConfig) -> ForecastSpec:
-    spec = replace(SPECS[horizon], depth=3, lead_lag=True, time_aug=True)
+    table = specs_for(cfg)
+    if horizon not in table:
+        raise ValueError(f"Horizon {horizon!r} is not available for asset={cfg.asset!r}; choose from {sorted(table)}")
+    spec = replace(table[horizon], depth=3, lead_lag=True, time_aug=True)
     overrides = dict(cfg.spec_overrides.get(horizon, {}))
     unknown = set(overrides) - {f for f in ForecastSpec.__dataclass_fields__ if f not in ("name", "sample_stride")}
     if unknown:
@@ -905,7 +945,8 @@ def with_target(ds: ForecastDataset, target: str, intraday: pd.DataFrame, spec: 
     if intraday is None:
         raise ValueError(f"The {target} target needs hourly bars; run it on the *_i horizons.")
     known = ds.times + pd.Timedelta(spec.bar_freq)
-    dd, ratio = future_drawdown_targets(intraday, known, spec.horizon, spec.intraday_freq or "1h")
+    ends = ds.target_end + pd.Timedelta(spec.bar_freq)  # = known + horizon for 24/7 crypto
+    dd, ratio = future_drawdown_targets(intraday, known, spec.horizon, spec.intraday_freq or "1h", ends=ends)
     y = dd if target == "drawdown" else ratio
     keep = np.isfinite(y)
     if (~keep).any():

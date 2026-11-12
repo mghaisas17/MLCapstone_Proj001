@@ -58,7 +58,9 @@ def build_rows(bars: pd.DataFrame, spec, max_window: int, target_rows: int | Non
     har_X = np.column_stack([np.log((csum[pos + 1] - csum[pos + 1 - w]) / w + EPS) for w in har])
     bar = pd.Timedelta(spec.bar_freq)
     times = pd.DatetimeIndex(bars.index[pos]) + bar
-    return Rows(pos, times, times + pd.Timedelta(spec.horizon), y, har_X, h)
+    # the target window ends after bar pos + h: + horizon for 24/7 data, later across an FX weekend
+    target_end = pd.DatetimeIndex(bars.index[pos + h]) + bar
+    return Rows(pos, times, target_end, y, har_X, h)
 
 
 # ---------------------------------------------------------------- windows

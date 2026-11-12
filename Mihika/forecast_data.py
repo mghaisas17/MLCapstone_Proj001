@@ -721,19 +721,23 @@ def har_log_target(bars: pd.DataFrame, i: int, horizon_steps: int) -> float:
 
 def future_drawdown_targets(
     intraday: pd.DataFrame, known_times, horizon: str, freq: str = "1h", min_coverage: float = 0.9,
+    ends=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Max drawdown of the log price over (known, known + horizon], from intraday closes, and that
     drawdown divided by the realized volatility of the same window.
 
     The path starts at the close of the last bar completed at the known time, so a fall straight
     from that price counts. Bars are labelled by their open time. A row whose window is missing
-    more than ``1 - min_coverage`` of its bars gets NaN for both."""
+    more than ``1 - min_coverage`` of its bars gets NaN for both. ``ends`` (default: known +
+    horizon) closes each window where its target does, which for markets that close at weekends
+    (FX) is ``horizon`` trading days later; ``horizon`` then sets how many bars to expect."""
     labels = _ns(intraday.index)
     known = _ns(known_times)
     step = np.timedelta64(int(pd.Timedelta(freq).value), "ns")
     span = np.timedelta64(int(pd.Timedelta(horizon).value), "ns")
     j0 = np.searchsorted(labels, known, side="left")  # first bar after the known time
-    j1 = np.searchsorted(labels, known + span, side="left")  # first bar after the window
+    stop = known + span if ends is None else _ns(ends)
+    j1 = np.searchsorted(labels, stop, side="left")  # first bar after the window
     expected = int(pd.Timedelta(horizon) / pd.Timedelta(freq))
     log_close = np.log(intraday["close"].to_numpy(float))
     dd, ratio = np.full(len(known), np.nan), np.full(len(known), np.nan)
@@ -1293,3 +1297,189 @@ def fetch_binance_klines_hourly(
     bars = _fill_bar_gaps(pd.concat(pieces), freq)
     bars = bars.loc[(bars.index >= start_ts.tz_localize("UTC")) & (bars.index < (end_ts + pd.Timedelta(days=1)).tz_localize("UTC"))]
     return bars
+
+
+# --------------------------------------------------------------------------
+# FX (EUR/USD and other Dukascopy pairs): hourly and daily bars for the new pipeline
+# --------------------------------------------------------------------------
+
+# FX trades ~5 days a week and every window is counted in bars, so a week is 5 daily bars and a
+# month 22 (the classic Corsi HAR 1/5/22), instead of crypto's 7/30. Daily and hourly bars both
+# come from Dukascopy, so the hourly path ends exactly where its daily row does.
+FX_SPECS: dict[str, ForecastSpec] = {
+    key: replace(SPECS["1d"], name=f"fx_{key}", horizon=h, lookback="22D", har_windows=("1D", "5D", "22D"))
+    for key, h in {"1d": "1D", "5d": "5D", "22d": "22D"}.items()
+}
+for _key in ("1d", "5d", "22d"):
+    FX_SPECS[f"{_key}_i"] = replace(FX_SPECS[_key], name=f"fx_{_key}_i", intraday_freq="1h")
+
+# The FX day runs 22:00 to 22:00 UTC (the New York 5pm close), so Sunday evening's trading
+# belongs to Monday and Friday ends at the weekly close.
+FX_DAY_START = pd.Timedelta(hours=-2)
+DUKASCOPY_URL = "https://datafeed.dukascopy.com/datafeed"
+# Hourly candle record: seconds from the start of the month, open, close, low, high (integer
+# points), volume -- big-endian, like the tick files decoded in forecast_data_fx_local.py.
+DUKASCOPY_CANDLE = np.dtype([("sec", ">u4"), ("open", ">u4"), ("close", ">u4"), ("low", ">u4"), ("high", ">u4"),
+                             ("vol", ">f4")])
+DUKASCOPY_TICK = np.dtype([("ms", ">u4"), ("ask", ">u4"), ("bid", ">u4"), ("ask_vol", ">f4"), ("bid_vol", ">f4")])
+
+
+def _dukascopy_point(symbol: str) -> float:
+    return 1e3 if "JPY" in symbol.upper() else 1e5
+
+
+def _dukascopy_get(url: str, timeout: int = 60, attempts: int = 5) -> bytes | None:
+    """One Dukascopy file, or None when it does not exist (404 or empty: weekends, the current
+    month). Transient failures are retried with backoff (2, 4, 8, 16 s)."""
+    import time
+
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(url, timeout=timeout)
+            if response.status_code == 404:
+                return None
+            if response.status_code >= 400:
+                raise requests.exceptions.HTTPError(f"HTTP {response.status_code} for {url}")
+            return response.content or None
+        except requests.exceptions.RequestException as exc:
+            if attempt == attempts:
+                raise
+            wait = 2**attempt
+            LOGGER.warning("Dukascopy download failed (%s), retrying in %ds: %s", type(exc).__name__, wait, url)
+            time.sleep(wait)
+    return None
+
+
+def decode_dukascopy_candles(content: bytes, start: pd.Timestamp, point: float) -> pd.DataFrame:
+    """Decode one LZMA-compressed Dukascopy candle file (records timed from ``start``)."""
+    import lzma
+
+    rec = np.frombuffer(lzma.decompress(content), dtype=DUKASCOPY_CANDLE)
+    return pd.DataFrame(
+        {"open": rec["open"] / point, "high": rec["high"] / point, "low": rec["low"] / point,
+         "close": rec["close"] / point, "volume": rec["vol"].astype(float)},
+        index=pd.DatetimeIndex(start + pd.to_timedelta(rec["sec"].astype(np.int64), unit="s"), name="timestamp"),
+    )
+
+
+def _candles_look_valid(c: pd.DataFrame) -> bool:
+    """Guard against a misread file: prices positive, high >= open/close >= low on (nearly) every bar."""
+    if c.empty:
+        return False
+    tol = 1e-9
+    ok = (c["low"] > 0) & (c["high"] + tol >= c[["open", "close"]].max(axis=1)) & \
+        (c["low"] - tol <= c[["open", "close"]].min(axis=1))
+    return bool(ok.mean() > 0.99)
+
+
+def _mid_hourly_from_candles(symbol: str, month: pd.Period) -> pd.DataFrame | None:
+    """Mid-price hourly bars for a month from Dukascopy's BID and ASK hourly candle files, or None."""
+    start = pd.Timestamp(month.start_time, tz="UTC")
+    point = _dukascopy_point(symbol)
+    sides = {}
+    for side in ("BID", "ASK"):
+        content = _dukascopy_get(f"{DUKASCOPY_URL}/{symbol}/{start.year}/{start.month - 1:02d}/{side}_candles_hour_1.bi5")
+        if content is None:
+            return None
+        sides[side] = decode_dukascopy_candles(content, start, point)
+        if not _candles_look_valid(sides[side]):
+            LOGGER.warning("Dukascopy %s %s %s candles failed the sanity check; using ticks", symbol, month, side)
+            return None
+    bid, ask = sides["BID"].align(sides["ASK"], join="inner")
+    mid = (bid[["open", "high", "low", "close"]] + ask[["open", "high", "low", "close"]]) / 2
+    mid["volume"] = bid["volume"] + ask["volume"]
+    return mid[mid["volume"] > 0]  # flat zero-volume hours are the closed market
+
+
+def _mid_hourly_from_ticks(symbol: str, day: pd.Timestamp) -> pd.DataFrame:
+    """Fallback: one UTC day of mid-price hourly bars from Dukascopy's hourly tick files
+    (the decoder from forecast_data_fx_local.py)."""
+    import lzma
+
+    point = _dukascopy_point(symbol)
+    rows = []
+    for hour in pd.date_range(day, periods=24, freq="h"):
+        content = _dukascopy_get(
+            f"{DUKASCOPY_URL}/{symbol}/{hour.year}/{hour.month - 1:02d}/{hour.day:02d}/{hour.hour:02d}h_ticks.bi5")
+        if content is None:
+            continue
+        rec = np.frombuffer(lzma.decompress(content), dtype=DUKASCOPY_TICK)
+        if not len(rec):
+            continue
+        mid = (rec["bid"] + rec["ask"]) / (2 * point)
+        rows.append({"timestamp": hour, "open": mid[0], "high": mid.max(), "low": mid.min(), "close": mid[-1],
+                     "volume": float(rec["bid_vol"].sum() + rec["ask_vol"].sum())})
+    if not rows:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"],
+                            index=pd.DatetimeIndex([], tz="UTC", name="timestamp"))
+    return pd.DataFrame(rows).set_index("timestamp")
+
+
+def _fx_bar_columns(bars: pd.DataFrame) -> pd.DataFrame:
+    """Add the columns the pipeline expects. FX has no trade direction, so signed flow uses the
+    tick rule at the bar level: the sign of the bar's move times its (quote) volume."""
+    bars = bars.sort_index()
+    bars = bars[~bars.index.duplicated(keep="last")]
+    bars["dollar_volume"] = bars["volume"] * bars["close"]
+    bars["signed_dollar_flow"] = np.sign(bars["close"] - bars["open"]) * bars["dollar_volume"]
+    return bars
+
+
+def fetch_dukascopy_hourly(
+    start: str | date,
+    end: str | date,
+    symbol: str = "EURUSD",
+    data_dir: str | Path = "data/dukascopy",
+    force_download: bool = False,
+) -> pd.DataFrame:
+    """Hourly mid-price OHLC + quote volume for an FX pair, cached per month. Only trading hours
+    are kept (no weekend bars), so windows counted in bars are windows of trading time.
+
+    Each month comes from Dukascopy's hourly candle files (2 downloads). If those are missing (the
+    current month) or fail the sanity check, the month is built from the hourly tick files instead
+    (24 downloads per day), the source already used in forecast_data_fx_local.py."""
+    data_dir = _ensure_data_dir(data_dir)
+    start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+    this_month = pd.Timestamp.now(tz="UTC").to_period("M")
+    pieces = []
+    for month in pd.period_range(start_ts, end_ts, freq="M"):
+        path = data_dir / f"{symbol}_1h_{month}.parquet"
+        if path.exists() and not force_download:
+            pieces.append(pd.read_parquet(path))
+            continue
+        LOGGER.info("Dukascopy %s %s (hourly)", symbol, month)
+        bars = _mid_hourly_from_candles(symbol, month)
+        if bars is None:
+            days = pd.date_range(pd.Timestamp(month.start_time, tz="UTC"),
+                                 min(pd.Timestamp(month.end_time, tz="UTC").normalize(),
+                                     pd.Timestamp(end_ts, tz="UTC")), freq="D")
+            parts = [_mid_hourly_from_ticks(symbol, d) for d in days if d.weekday() != 5]
+            bars = pd.concat(parts) if parts else None
+        if bars is None or bars.empty:
+            LOGGER.warning("No Dukascopy data for %s %s", symbol, month)
+            continue
+        bars = _fx_bar_columns(bars)
+        if month < this_month:  # a finished month never changes; the current one is refetched
+            bars.to_parquet(path)
+        pieces.append(bars)
+    if not pieces:
+        raise ValueError(f"No Dukascopy data could be loaded for {symbol} {start}..{end}.")
+    bars = pd.concat(pieces).sort_index()
+    bars = bars[~bars.index.duplicated(keep="last")]
+    lo, hi = pd.Timestamp(start_ts, tz="UTC"), pd.Timestamp(end_ts, tz="UTC") + pd.Timedelta(days=1)
+    return validate_ohlc(bars.loc[(bars.index >= lo) & (bars.index < hi)])
+
+
+def fx_daily_from_hourly(hourly: pd.DataFrame, min_hours: int = 20) -> pd.DataFrame:
+    """Daily FX bars from hourly ones, one per FX day (22:00 to 22:00 UTC). Each bar is labelled
+    by its START time, so ``label + 1 day`` is when it is complete -- the convention every
+    dataset here uses -- and the hourly path for that row ends with the day's last hourly bar.
+    Days with fewer than ``min_hours`` hourly bars (holidays, the Sunday stub) are dropped."""
+    day = (hourly.index - FX_DAY_START).floor("D")  # 22:00 UTC belongs to the next date
+    g = hourly.groupby(day)
+    daily = g.agg(open=("open", "first"), high=("high", "max"), low=("low", "min"), close=("close", "last"),
+                  volume=("volume", "sum"), dollar_volume=("dollar_volume", "sum"),
+                  signed_dollar_flow=("signed_dollar_flow", "sum"))
+    daily = daily[g.size() >= min_hours]
+    daily.index = pd.DatetimeIndex(daily.index + FX_DAY_START, name="timestamp")
+    return validate_ohlc(daily)

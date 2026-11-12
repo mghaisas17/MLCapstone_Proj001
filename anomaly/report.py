@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
-from .config import EVENTS, HORIZONS
+from .config import EVENTS, FX_EVENTS, horizon_specs
 
 KIND_ORDER = ["signature", "lag bank", "stats", "raw", "baseline"]
 
@@ -26,7 +26,7 @@ class Results:
 def load_results(output_dir) -> Results:
     root = Path(output_dir)
     metrics, scores, selection, meta = [], [], {}, {}
-    for hk in HORIZONS:
+    for hk in sorted({*horizon_specs("crypto"), *horizon_specs("fx")}, key=lambda h: (h[-1] != "h", int(h[:-1]))):
         d = root / hk
         if not (d / "meta.json").exists():
             continue
@@ -122,9 +122,10 @@ def plot_timeline(res: Results, horizon: str = "1d"):
         z["pct"] = z.groupby("Fold").Score.rank(pct=True)
         ax.plot(pd.to_datetime(z.Time), z.pct.rolling(5, min_periods=1).mean(), lw=0.8, color=color,
                 label=f"{which.replace('_', ' ')}: {c['Config']} [{c['Detector']}]")
-    for name, (a, b) in EVENTS.items():
+    asset = res.meta[horizon].get("asset", "crypto")
+    for name, (a, b) in (FX_EVENTS if asset == "fx" else EVENTS).items():
         ax.axvspan(pd.Timestamp(a, tz="UTC"), pd.Timestamp(b, tz="UTC"), color="grey", alpha=0.15)
-    ax.set(ylabel="score percentile (5-row mean)", title=f"{HORIZONS[horizon].label}: anomaly scores, crises shaded")
+    ax.set(ylabel="score percentile (5-row mean)", title=f"{horizon_specs(asset)[horizon].label}: anomaly scores, crises shaded")
     ax.legend(fontsize=7, loc="upper left")
     fig.tight_layout()
     return fig

@@ -5,6 +5,7 @@
 Says nothing about real markets: it checks no look-ahead, that every detector x representation
 runs, the synthetic order-only test, resume, selection/gate files and the report functions.
 """
+import json
 import math
 import sys
 import tempfile
@@ -206,6 +207,34 @@ def test_pipeline(tmp):
     ok("report tables and figures")
 
 
+def test_fx(tmp):
+    """asset="fx": weekday-only hourly bars, 1 / 5 trading-day horizons, windows counted in bars."""
+    h = synth_bars(24 * 7 * 140, "1h")
+    h = h[(h.index + pd.Timedelta(hours=2)).dayofweek < 5]
+    RUN.fetch_dukascopy_hourly = lambda *a, **k: h
+    spec = C.horizon_specs("fx")["5d"]
+    rows = build_rows(h, spec, spec.window, None)
+    gap = (rows.target_end - rows.times) > pd.Timedelta(days=5)
+    assert gap.any() and (rows.target_end == pd.DatetimeIndex(h.index[rows.pos + rows.horizon_steps]) + pd.Timedelta("1h")).all(), \
+        "an FX target window ends 120 trading hours later, across the weekend"
+    cfg = C.AnomalyConfig(
+        asset="fx", symbol="EURUSD", horizons=("1d", "5d"), min_train_rows=60,
+        channel_sets=("price", "price+volume+range+flow"), window_mults=(1.0,), lead_lag=(True,),
+        depths=(2,), stage_b_top_k=1, stage_b_detectors=("hmm",), n_bootstrap=20,
+        data_dir=str(tmp / "data"), output_dir=str(tmp / "fx_results"),
+    )
+    root = RUN.run_all(cfg)
+    res = R.load_results(root)
+    assert set(res.meta) == {"1d", "5d"} and all(m["asset"] == "fx" for m in res.meta.values())
+    assert set(json.loads((Path(root) / "best_configs.json").read_text())) == {"1d", "5d"}
+    import matplotlib.pyplot as plt
+
+    fig = R.plot_timeline(res, "5d")
+    fig.savefig(tmp / "fx.png", dpi=40)
+    plt.close(fig)
+    ok("FX: weekday-only bars, 1 / 5 trading-day horizons, weekend-spanning targets, report")
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
@@ -213,4 +242,5 @@ if __name__ == "__main__":
         test_synthetic_order_only()
         test_hmm_detector()
         test_pipeline(tmp)
+        test_fx(tmp)
     print("\nALL ANOMALY SMOKE CHECKS PASSED")

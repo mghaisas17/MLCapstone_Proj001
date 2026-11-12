@@ -39,11 +39,11 @@ import numpy as np
 import pandas as pd
 
 from . import detectors as det
-from .config import CHANNEL_SETS, HORIZONS, AnomalyConfig, RepConfig
+from .config import CHANNEL_SETS, AnomalyConfig, RepConfig, horizon_specs
 from .evaluate import block_bootstrap_diff, fold_labels, reorder_injection, score_metrics
 from .features import build_rows, extract_windows, representations
 from experiment import purged_walk_forward
-from forecast_data import fetch_binance_klines_hourly
+from forecast_data import fetch_binance_klines_hourly, fetch_dukascopy_hourly
 
 LOGGER = logging.getLogger(__name__)
 SIGNATURE = "signature"
@@ -51,6 +51,10 @@ SIGNATURE = "signature"
 
 def load_bars(spec, cfg: AnomalyConfig) -> pd.DataFrame:
     end = cfg.end or str(pd.Timestamp.now(tz="UTC").date())
+    if cfg.asset == "fx":  # trading hours only: windows in bars are windows of trading time
+        if spec.bar_freq != "1h":
+            raise ValueError("FX anomaly horizons use hourly bars.")
+        return fetch_dukascopy_hourly(cfg.start, end, symbol=cfg.symbol, data_dir=Path(cfg.data_dir) / "dukascopy")
     return fetch_binance_klines_hourly(cfg.start, end, symbol=cfg.symbol, data_dir=Path(cfg.data_dir) / "klines",
                                        freq=spec.bar_freq)
 
@@ -172,13 +176,13 @@ def synthetic_check(choice: dict, bars, rows, folds, spec, cfg) -> dict:
     return {"AUC_injected": float(roc_auc_score(injected, model.score(Xs)))}
 
 
-BLOCK_DAYS = {"1h": 1, "1d": 10, "7d": 20}  # bootstrap block length (labels overlap for longer horizons)
+BLOCK_DAYS = {"1h": 1, "1d": 10, "7d": 20, "5d": 15}  # bootstrap block length (labels overlap for longer horizons)
 
 
 def _prepare(hk: str, cfg: AnomalyConfig, until=None):
     """Bars, rows, folds and labels for a horizon. ``until`` truncates rows to a previous run's
     last row time, so a finished horizon can be extended (add_detector) on identical rows."""
-    spec = HORIZONS[hk]
+    spec = horizon_specs(cfg.asset)[hk]
     bars = load_bars(spec, cfg)
     max_w = int(round(spec.window * max(cfg.window_mults)))
     rows = build_rows(bars, spec, max_w, cfg.target_rows.get(hk))
@@ -237,7 +241,7 @@ def _select_gate_write(hk, metrics_df, scores_df, bars, rows, folds, labels, spe
     scores_df.to_parquet(out / "scores.parquet", index=False)
     (out / "selection.json").write_text(json.dumps(selection, indent=2, default=float))
     meta = {"horizon": hk, "rows": int(len(rows.y)), "folds": [[len(f.train), len(f.test)] for f in folds],
-            "first_time": str(rows.times[0]), "last_time": str(rows.times[-1]), **meta_extra}
+            "first_time": str(rows.times[0]), "last_time": str(rows.times[-1]), "asset": cfg.asset, **meta_extra}
     (out / "meta.json").write_text(json.dumps(meta, indent=2))  # written last = complete
 
 
@@ -299,7 +303,7 @@ def add_detector(cfg: AnomalyConfig, hk: str, detector: str = "hmm") -> Path:
 def write_best_configs(root: Path) -> None:
     """best_configs.json from every finished horizon in the output folder (not just this run's)."""
     best = {}
-    for hk in HORIZONS:
+    for hk in sorted({*horizon_specs("crypto"), *horizon_specs("fx")}):
         f = root / hk / "selection.json"
         if (root / hk / "meta.json").exists() and f.exists():
             best[hk] = json.loads(f.read_text())
@@ -326,7 +330,7 @@ def run_all(cfg: AnomalyConfig, subprocess_per_horizon: bool = False) -> Path:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--config")
-    p.add_argument("--horizons", nargs="+", choices=list(HORIZONS))
+    p.add_argument("--horizons", nargs="+", choices=sorted({*horizon_specs("crypto"), *horizon_specs("fx")}))
     p.add_argument("--quick", action="store_true")
     p.add_argument("--output")
     args = p.parse_args()

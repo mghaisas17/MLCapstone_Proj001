@@ -25,6 +25,19 @@ HORIZONS = {
     "7d": HorizonSpec("7d", "7 day", "1h", 720, "7D", "1D", ("1D", "7D", "30D"), 96),
 }
 
+# FX trades only on weekdays and every duration here is counted in hourly BARS, so "5D" is 120
+# bars = 5 trading days. Windows: one trading week (1 day) and one trading month (5 days).
+FX_HORIZONS = {
+    "1d": HorizonSpec("1d", "1 day", "1h", 120, "1D", "1D", ("1D", "5D", "22D"), 96),
+    "5d": HorizonSpec("5d", "5 day", "1h", 528, "5D", "1D", ("1D", "5D", "22D"), 96),
+}
+
+
+def horizon_specs(asset: str = "crypto") -> dict:
+    if asset not in ("crypto", "fx"):
+        raise ValueError(f"asset must be 'crypto' or 'fx', got {asset!r}")
+    return FX_HORIZONS if asset == "fx" else HORIZONS
+
 CHANNEL_SETS = {
     "price": ("price",),
     "price+volume": ("price", "activity"),
@@ -32,6 +45,12 @@ CHANNEL_SETS = {
 }
 
 # Labeled crises (from Aayush/configs/horizons.yaml), used only for the timeline case study.
+FX_EVENTS = {
+    "SNB floor removal": ("2015-01-15", "2015-01-31"),
+    "Brexit vote": ("2016-06-23", "2016-07-15"),
+    "COVID crash": ("2020-03-01", "2020-04-15"),
+    "EUR/USD below parity": ("2022-07-12", "2022-10-31"),
+}
 EVENTS = {
     "COVID crash": ("2020-02-20", "2020-04-30"),
     "2021 run-up and crash": ("2021-01-01", "2021-05-31"),
@@ -58,6 +77,7 @@ class RepConfig:
 @dataclass
 class AnomalyConfig:
     horizons: tuple = ("1h", "1d", "7d")  # finished horizons are skipped (resume), not re-run
+    asset: str = "crypto"  # "fx": Dukascopy hourly bars of `symbol` (e.g. EURUSD), FX_HORIZONS
     n_folds: int = 3
     min_train_rows: int = 200
     start: str = "2017-08-01"

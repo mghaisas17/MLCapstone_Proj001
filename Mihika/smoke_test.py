@@ -471,6 +471,126 @@ def test_interpretation_figures(tmp, dd_results):
     ok(f"interpretation figures render ({len(figs)} figures, vol + drawdown results)")
 
 
+# ---------------------------------------------------------------- FX (asset="fx")
+def fx_hourly(n_weeks=60):
+    """Synthetic EUR/USD-like hourly bars on FX trading hours only (Sunday 22:00 to Friday 22:00 UTC)."""
+    h = synth_bars(24 * 7 * n_weeks, "1h", True)
+    h = h[(h.index + pd.Timedelta(hours=2)).dayofweek < 5].copy()
+    for c in ("open", "high", "low", "close"):
+        h[c] *= 1.1 / 30_000
+    h["dollar_volume"] = h["volume"] * h["close"]
+    return h
+
+
+def test_fx_data(tmp):
+    import lzma
+
+    h = fx_hourly(6)
+    d = fd.fx_daily_from_hourly(h)
+    assert (d.index.hour == 22).all(), "FX days start at 22:00 UTC"
+    assert ((d.index + pd.Timedelta(hours=2)).dayofweek < 5).all() and len(d) == 6 * 5, "Monday-Friday FX days only"
+    last_hour = h["close"].reindex(d.index + pd.Timedelta(hours=23))
+    assert np.allclose(last_hour.to_numpy(), d["close"].to_numpy()), "a daily bar ends with its last hourly bar"
+    assert np.allclose(h["volume"].groupby((h.index + pd.Timedelta(hours=2)).floor("D")).sum().to_numpy(), d["volume"])
+
+    # candle files: decode, sanity check, and the monthly loader with the tick fallback
+    t0 = pd.Timestamp("2024-03-01", tz="UTC")
+    rec = np.zeros(48, dtype=fd.DUKASCOPY_CANDLE)
+    rec["sec"] = np.arange(48) * 3600
+    rec["open"], rec["close"] = 108_000 + np.arange(48), 108_010 + np.arange(48)
+    rec["low"], rec["high"] = rec["open"] - 20, rec["close"] + 20
+    rec["vol"] = 1.5
+    blob = lzma.compress(rec.tobytes())
+    c = fd.decode_dukascopy_candles(blob, t0, 1e5)
+    assert c.index[1] == t0 + pd.Timedelta(hours=1) and np.isclose(c["open"].iloc[0], 1.08) and fd._candles_look_valid(c)
+    swapped = c.rename(columns={"low": "high", "high": "low"})
+    assert not fd._candles_look_valid(swapped), "a misread field order must fail the sanity check"
+
+    tick = np.zeros(3, dtype=fd.DUKASCOPY_TICK)
+    tick["ask"], tick["bid"] = [108_002, 108_012, 108_007], [108_000, 108_010, 108_005]
+    tick["ask_vol"] = tick["bid_vol"] = 0.5
+    tick_blob = lzma.compress(tick.tobytes())
+    calls = []
+
+    def fake_get(url, **k):
+        calls.append(url)
+        if "candles_hour" in url:
+            return blob if "/2024/02/" in url else None  # March (0-based 02) has candles, April does not
+        return tick_blob if "/2024/03/01/" in url else None  # one April day of ticks
+    real = fd._dukascopy_get
+    fd._dukascopy_get = fake_get
+    try:
+        bars = fd.fetch_dukascopy_hourly("2024-03-01", "2024-04-02", data_dir=tmp / "duka")
+    finally:
+        fd._dukascopy_get = real
+    march = bars[bars.index < pd.Timestamp("2024-04-01", tz="UTC")]
+    april = bars[bars.index >= pd.Timestamp("2024-04-01", tz="UTC")]
+    assert len(march) == 48 and np.isclose(march["close"].iloc[0], 1.0801), "mid of BID and ASK candles"
+    assert len(april) == 24 and np.isclose(april["high"].iloc[0], (108_012 + 108_010) / 2e5), "tick fallback"
+    assert {"dollar_volume", "signed_dollar_flow"} <= set(bars.columns)
+    assert (tmp / "duka" / "EURUSD_1h_2024-03.parquet").exists()
+    ok("FX data: 22:00 UTC FX days, Dukascopy candle decoding + sanity check, tick fallback, monthly cache")
+
+
+def test_fx_pipeline(tmp):
+    import json
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from anomaly.config import AnomalyConfig
+
+    h = fx_hourly(70)
+    ex.fetch_dukascopy_hourly = lambda *a, **k: h
+    ex._INTRADAY_MEMO.clear()
+    base = dict(asset="fx", torch_epochs=2, xgb_estimators=10, target_rows={}, data_dir=str(tmp / "data"),
+                cache_dir=str(tmp / "cache_fx"))
+    models = ("Mean", "HAR-RV-L", "HAR-RV-L calibrated", "GARCH(1,1) | rolling refit", "Ridge | stats",
+              "Ridge | signature", "Ridge | lag bank (matched)", "Ridge | multiscale stats", "XGBoost | signature",
+              "HAR-RV-L + flag")
+    cfg = ex.ExperimentConfig(horizons=ex.FX_MAIN_HORIZONS, models=models, output_dir=str(tmp / "fx" / "main"),
+                              ablation_models=("Ridge | signature",), **base)
+    res = rp.load_results(ex.run_all(cfg))
+    assert set(res.meta) == set(ex.FX_MAIN_HORIZONS) and set(res.metrics.Model) == set(models)
+    assert set(res.metrics.Horizon) == {"1 day", "5 day", "22 day"} and np.isfinite(res.metrics.RMSE).all()
+    assert not res.flags.empty and not res.ablations.empty and len(rp.control_table(res))
+    t = pd.DatetimeIndex(res.predictions.Time)
+    assert (t.hour == 22).all() and ((t + pd.Timedelta(hours=2)).dayofweek < 5).all(), "rows are FX days"
+    try:
+        ex.run_horizon("5m", ex.ExperimentConfig(asset="fx", output_dir=str(tmp / "fx" / "bad")))
+        raise AssertionError("5 min must be refused for FX")
+    except ValueError:
+        pass
+    ok("FX volatility run: 1 / 5 / 22 trading days, GARCH, flag, ablations, controls, FX-day rows")
+
+    # anomaly selection for FX, then hourly paths + anomaly models + drawdown on the *_i horizons
+    adir = tmp / "fx_anomaly"
+    adir.mkdir(parents=True, exist_ok=True)
+    AnomalyConfig(asset="fx", symbol="EURUSD", start="2024-01-01", data_dir=str(tmp / "data")).to_json(adir / "config.json")
+    sel = {k: {"best_signature": {"Config": "signature d2 | price|none|w1|time", "Kind": "signature", "Detector": "mahalanobis"},
+               "best_signature_free": {"Config": "stats | none|w1", "Kind": "stats", "Detector": "iforest"}}
+           for k in ("1d", "5d")}
+    (adir / "best_configs.json").write_text(json.dumps(sel))
+    names = ex.anomaly_model_names()
+    icfg = ex.ExperimentConfig(horizons=("1d_i", "5d_i"), output_dir=str(tmp / "fx" / "anomaly_vol"), run_ablations=False,
+                               use_flag=False, use_anomaly=True, anomaly_selection=str(adir / "best_configs.json"),
+                               models=("Mean", "HAR-RV-L", "HAR-RV-L calibrated", "HAR-RV-L (intraday RV)",
+                                       "Ridge | signature", "Ridge | intraday signature",
+                                       "Ridge | intraday lag bank (matched)", *names),
+                               spec_overrides={k: {"intraday_path_points": 24} for k in ("1d_i", "5d_i")}, **base)
+    ires = rp.load_results(ex.run_all(icfg))
+    assert set(ires.meta) == {"1d_i", "5d_i"} and set(names) <= set(ires.metrics.Model)
+    assert np.isfinite(ires.metrics.RMSE).all() and len(rp.anomaly_effect_table(ires)) and len(rp.intraday_table(ires))
+
+    for target in ("drawdown", "drawdown_ratio"):
+        dcfg = ex.ExperimentConfig(**{**vars(icfg), "target": target, "output_dir": str(tmp / "fx" / "drawdown" / target)})
+        dres = rp.load_results(ex.run_all(dcfg))
+        p = dres.predictions[dres.predictions.HorizonKey == "5d_i"]
+        fridays = (pd.DatetimeIndex(p.Time) + pd.Timedelta(hours=2)).dayofweek == 4
+        assert fridays.any(), "windows that cross the weekend must be kept"
+        assert len(p.Time.unique()) > 0.9 * len(ires.predictions[ires.predictions.HorizonKey == "5d_i"].Time.unique())
+        assert np.isfinite(dres.predictions.Prediction).all() and len(rp.shape_table(dres)) and len(rp.anomaly_auc_table(dres))
+    ok("FX hourly paths, anomaly score in the forecasts, and both drawdown targets (weekends handled)")
+
+
 def test_download_retry():
     import requests, time as _time
 
@@ -674,4 +794,6 @@ if __name__ == "__main__":
         test_drawdown_math()
         dd = test_drawdown_pipeline(tmp)
         test_interpretation_figures(tmp, dd)
+        test_fx_data(tmp)
+        test_fx_pipeline(tmp)
     print("\nALL SMOKE CHECKS PASSED")
