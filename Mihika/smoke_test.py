@@ -491,7 +491,9 @@ def test_fx_data(tmp):
     assert ((d.index + pd.Timedelta(hours=2)).dayofweek < 5).all() and len(d) == 6 * 5, "Monday-Friday FX days only"
     last_hour = h["close"].reindex(d.index + pd.Timedelta(hours=23))
     assert np.allclose(last_hour.to_numpy(), d["close"].to_numpy()), "a daily bar ends with its last hourly bar"
-    assert np.allclose(h["volume"].groupby((h.index + pd.Timedelta(hours=2)).floor("D")).sum().to_numpy(), d["volume"])
+    g = h["volume"].groupby((h.index + pd.Timedelta(hours=2)).floor("D"))
+    full = g.sum()[g.size() >= 20]  # the trailing Sunday stub (2 hours) is not a trading day
+    assert np.allclose(full.to_numpy(), d["volume"].to_numpy())
 
     # candle files: decode, sanity check, and the monthly loader with the tick fallback
     t0 = pd.Timestamp("2024-03-01", tz="UTC")
