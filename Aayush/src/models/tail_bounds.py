@@ -49,7 +49,15 @@ def fit_weibull_tail(calibration_scores: np.ndarray, N: int, tail_fraction: floa
     positive = tail_scores > 0
     x = tail_scores[positive] ** (2.0 / N)
     y = np.log(tail_survival[positive])
-    B, log_A = -np.polyfit(x, y, 1)
+    # The model is log(survival) = log_A - B*x, i.e. slope = -B, intercept = log_A.
+    # np.polyfit(x, y, 1) returns [slope, intercept] directly (that convention,
+    # not negated) -- only the slope's sign flips to recover B; log_A is the
+    # intercept as-is. A previous version negated the whole polyfit() result,
+    # which also flipped log_A's sign and produced a badly wrong A (verified:
+    # on held-out calibration scores, the resulting alpha=0.01 threshold sat
+    # below the sample's OWN minimum, flagging ~99% of days instead of ~1%).
+    slope, intercept = np.polyfit(x, y, 1)
+    B, log_A = -slope, intercept
     return float(np.exp(log_A)), float(B)
 
 
