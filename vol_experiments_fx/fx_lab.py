@@ -83,6 +83,20 @@ VOL_COMPARISONS = [
 ANOMALY_MODELS = tuple(f"{m} [{w}]" for m in ("HAR-RV-L + anomaly", "HAR-RV-L + anomaly residual")
                        for w in ex.ANOMALY_VARIANTS)
 
+# More currency pairs: the same vol run (same settings, channels and ablations) on each pair.
+# EUR/USD is the main run above (results/vol); the others go to results/pairs/<pair>/.
+PAIRS = ("EURUSD", "GBPUSD", "USDJPY", "AUDUSD")
+PAIR_MODELS = {  # column name -> model, for the cross-pair table (% better than HAR-RV-L)
+    "Signature": "Ridge | intraday signature",
+    "Signature + HAR-RV": "Ridge | intraday signature + HAR-RV",
+    "Multiscale stats": "Ridge | intraday multiscale stats",
+    "HAR on hourly RV": "HAR-RV-L (intraday RV)",
+    "HAR calibrated": "HAR-RV-L calibrated",
+}
+PAIR_TESTS = [("Ridge | intraday signature", [
+    "HAR-RV-L", "HAR-RV-L calibrated", "Ridge | intraday lag bank (matched)", "Ridge | intraday multiscale stats"])]
+PAIR_DIRECTION_MODELS = ("Logit | HAR", "Logit | HAR + intraday signature", "HAR-RV-L", "Ridge | intraday signature")
+
 # Anomaly study grid: channels are the only axis; the rest is fixed in advance
 ANOMALY_CHANNELS = ("price", "price+volume+range+flow", "price_sa", "price_sa+spread",
                     "price_sa+volume+range_sa+spread")
@@ -106,6 +120,15 @@ def vol_config(quick: bool = False, **changes) -> ex.ExperimentConfig:
     return replace(cfg, **changes)
 
 
+def pair_vol_config(symbol: str, quick: bool = False, **changes) -> ex.ExperimentConfig:
+    """The vol run for one currency pair: identical to ``vol_config`` except the symbol and the
+    output folder (EUR/USD keeps the main run's folder, so it is not recomputed)."""
+    if symbol == SYMBOL:
+        return vol_config(quick, **changes)
+    changes = {"output_dir": str(RESULTS / "pairs" / symbol / ("vol_quick" if quick else "vol")), **changes}
+    return vol_config(quick, fx_symbol=symbol, **changes)
+
+
 def anomaly_config(quick: bool = False, **changes) -> AnomalyConfig:
     cfg = AnomalyConfig(
         asset="fx", symbol=SYMBOL, fx_channels=True, horizons=("1d", "5d"), start=START, end=END,
@@ -119,9 +142,9 @@ def anomaly_config(quick: bool = False, **changes) -> AnomalyConfig:
     return replace(cfg, **changes)
 
 
-def load_hourly(start: str = START, end: str = END) -> pd.DataFrame:
+def load_hourly(start: str = START, end: str = END, symbol: str = SYMBOL) -> pd.DataFrame:
     """The hourly bars every run here uses, with the spread and the adjusted channels."""
-    bars = fetch_dukascopy_hourly(start, end, symbol=SYMBOL, data_dir=DATA_DIR / "dukascopy", spread=True)
+    bars = fetch_dukascopy_hourly(start, end, symbol=symbol, data_dir=DATA_DIR / "dukascopy", spread=True)
     return fx_hourly_channels(bars)
 
 
@@ -214,6 +237,107 @@ def compare_with_previous(res: rp.Results, previous_dir: str | Path = ROOT / "Mi
     return both[["Horizon", "Model", "Pct_vs_HAR_previous", "Pct_vs_HAR_new", "Mean_RMSE_previous", "Mean_RMSE_new"]]
 
 
+# ---------------------------------------------------------------- more currency pairs
+
+
+def run_pairs(pairs=PAIRS, quick: bool = False, direction: bool = True, subprocess_per_horizon: bool = True,
+              **changes) -> dict:
+    """Run the vol forecasts (and the direction target) for each pair; finished horizons are
+    skipped, so this resumes. Returns {pair: config}. The first run downloads each pair's BID and
+    ASK candles (about 360 files per pair, rate-limited: up to an hour per pair)."""
+    cfgs = {}
+    for sym in pairs:
+        cfg = pair_vol_config(sym, quick, **changes)
+        LOGGER.info("==== %s ====", sym)
+        ex.run_all(cfg, subprocess_per_horizon=subprocess_per_horizon)
+        if direction:
+            run_direction(cfg)
+        cfgs[sym] = cfg
+    return cfgs
+
+
+def load_pairs(cfgs: dict) -> dict:
+    """{pair: Results} for the pairs whose vol run has finished."""
+    out = {}
+    for sym, cfg in cfgs.items():
+        try:
+            out[sym] = rp.load_results(cfg.output_dir)
+        except (FileNotFoundError, ValueError) as exc:
+            LOGGER.warning("%s: no results yet (%s)", sym, exc)
+    return out
+
+
+def pairs_level_table(results: dict) -> pd.DataFrame:
+    """One row per pair and horizon: fold-mean RMSE % better than HAR-RV-L for the key models,
+    plus the signature on the original channels (price, activity, range) from the channel ablation."""
+    rows = []
+    for sym, res in results.items():
+        s = rp.summary_table(res)
+        s["Horizon"] = s.Horizon.astype(str)
+        pct = s.set_index(["Horizon", "Model"]).Pct_vs_HAR
+        abl = ablation_table(res) if not res.ablations.empty else None
+        for h in s.Horizon.unique():
+            row = {"Pair": sym, "Horizon": h}
+            for col, model in PAIR_MODELS.items():
+                row[col] = pct.get((h, model), np.nan)
+            if abl is not None:
+                a = abl[(abl.Horizon.astype(str) == h) & (abl.Experiment == "Channels") & (abl.Setting == CHANNEL_REFERENCE)]
+                row["Signature, original channels"] = float(a.Pct_vs_HAR.iloc[0]) if len(a) else np.nan
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def pairs_test_table(results: dict) -> pd.DataFrame:
+    """The signature model against HAR, calibrated HAR, the matched lag bank and multiscale stats,
+    per pair and horizon: pooled RMSE % better (> 0 = signature better) and the Diebold-Mariano p."""
+    frames = []
+    for sym, res in results.items():
+        t = rp.pair_table(res, PAIR_TESTS)
+        if len(t):
+            frames.append(t.assign(Pair=sym, Horizon=t.Horizon.astype(str)))
+    t = pd.concat(frames, ignore_index=True)
+    wide = t.pivot_table(index=["Horizon", "Pair"], columns="Versus", values=["Pct_better", "DM_p"], sort=False)
+    return wide.swaplevel(0, 1, axis=1).sort_index(axis=1, level=0, sort_remaining=False)
+
+
+def pairs_direction_table(cfgs: dict, n_boot: int = 300) -> pd.DataFrame:
+    """Direction AUC per pair and horizon for the HAR classifier, HAR + signature classifier, and the
+    HAR and signature vol forecasts (forecast vs the past level)."""
+    rows = []
+    for sym, cfg in cfgs.items():
+        root = direction_dir(cfg)
+        if not root.exists():
+            continue
+        t = direction_table(*load_direction(root), n_boot=n_boot)
+        t = t[t.Model.isin(PAIR_DIRECTION_MODELS)]
+        for _, r in t.iterrows():
+            rows.append({"Pair": sym, "Horizon": str(r.Horizon), "Model": f"{r.Model} ({r.Source})", "AUC": r.AUC})
+    d = pd.DataFrame(rows)
+    return d.pivot_table(index=["Horizon", "Pair"], columns="Model", values="AUC", sort=False)
+
+
+def plot_pairs(level: pd.DataFrame, cols=("Signature", "Signature, original channels", "HAR on hourly RV", "HAR calibrated")):
+    """% RMSE better than HAR-RV-L per pair, one panel per horizon."""
+    import matplotlib.pyplot as plt
+
+    cols = [c for c in cols if c in level]
+    hz = list(dict.fromkeys(level.Horizon))
+    fig, axes = plt.subplots(1, len(hz), figsize=(6.5 * len(hz), 3.8), squeeze=False, sharey=True)
+    w = 0.8 / len(cols)
+    for ax, h in zip(axes[0], hz):
+        g = level[level.Horizon == h].reset_index(drop=True)
+        x = np.arange(len(g))
+        for j, c in enumerate(cols):
+            ax.bar(x + (j - (len(cols) - 1) / 2) * w, g[c], width=w, label=c)
+        ax.axhline(0, color="black", lw=0.8)
+        ax.set_xticks(x, g.Pair)
+        ax.set(title=h, ylabel="% RMSE better than HAR-RV-L")
+    axes[0][0].legend(fontsize=8)
+    fig.suptitle("Does the hourly path help beyond HAR, pair by pair?")
+    fig.tight_layout()
+    return fig
+
+
 # ---------------------------------------------------------------- volatility direction
 
 
@@ -259,6 +383,12 @@ DIRECTION_FEATURES = {  # logistic classifiers: HAR features plus one hourly-win
 }
 
 
+def direction_dir(cfg: ex.ExperimentConfig) -> Path:
+    """Where the direction results of a vol run go: next to it (``direction`` / ``direction_quick``)."""
+    out = Path(cfg.output_dir)
+    return out.parent / ("direction_quick" if out.name.endswith("_quick") else "direction")
+
+
 def run_direction(cfg: ex.ExperimentConfig, output_dir: str | Path | None = None) -> Path:
     """Direction of volatility, per horizon: up = realized vol over the next h days above the last h days.
 
@@ -268,7 +398,7 @@ def run_direction(cfg: ex.ExperimentConfig, output_dir: str | Path | None = None
     * logistic classifiers (DIRECTION_FEATURES), refit per fold on the same purged folds, with C
       chosen by an inner purged walk-forward CV on log loss.
     Finished horizons are skipped."""
-    out_root = Path(output_dir or Path(cfg.output_dir).parent / "direction")
+    out_root = Path(output_dir or direction_dir(cfg))
     vol = rp.load_results(cfg.output_dir)
     for horizon in cfg.horizons:
         out = out_root / horizon

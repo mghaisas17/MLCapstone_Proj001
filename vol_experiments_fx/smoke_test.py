@@ -120,6 +120,27 @@ def test_vol_and_direction(tmp: Path, h: pd.DataFrame):
     return cfg
 
 
+def test_pairs(tmp: Path, cfg: ex.ExperimentConfig):
+    """Two pairs through the cross-pair section (synthetic bars stand in for every symbol)."""
+    assert L.pair_vol_config("EURUSD").output_dir == L.vol_config().output_dir
+    assert L.pair_vol_config("USDJPY").fx_symbol == "USDJPY" and "pairs/USDJPY/vol" in L.pair_vol_config("USDJPY").output_dir
+    assert L.pair_vol_config("USDJPY", quick=True).output_dir.endswith("vol_quick")
+    keep = {k: getattr(cfg, k) for k in ("fx_start", "intraday_end", "torch_epochs", "spec_overrides", "data_dir", "cache_dir")}
+    cfgs = {"EURUSD": cfg}
+    ex._INTRADAY_MEMO.clear()
+    cfgs.update(L.run_pairs(("GBPUSD",), subprocess_per_horizon=False, output_dir=str(tmp / "pairs" / "GBPUSD" / "vol"), **keep))
+    assert cfgs["GBPUSD"].fx_symbol == "GBPUSD" and (tmp / "pairs" / "GBPUSD" / "direction").exists()
+    results = L.load_pairs(cfgs)
+    level = L.pairs_level_table(results)
+    assert set(level.Pair) == {"EURUSD", "GBPUSD"} and level["Signature, original channels"].notna().all()
+    tests = L.pairs_test_table(results)
+    assert {"HAR-RV-L", "Ridge | intraday lag bank (matched)"} <= set(tests.columns.get_level_values(0))
+    d = L.pairs_direction_table(cfgs, n_boot=20)
+    assert len(d) == 4 and d.notna().all().all()
+    plt.close(L.plot_pairs(level))
+    ok("more pairs: per-pair runs and direction, cross-pair level / test / direction tables, figure")
+
+
 def test_anomaly(tmp: Path, h: pd.DataFrame, cfg: ex.ExperimentConfig):
     acfg = L.anomaly_config(start="2022-01-01", end=None, min_train_rows=60, n_bootstrap=20, stage_b_top_k=1,
                             data_dir=str(tmp / "data"), output_dir=str(tmp / "anomaly"))
@@ -164,5 +185,6 @@ if __name__ == "__main__":
         tmp = Path(d)
         test_channels(h)
         cfg = test_vol_and_direction(tmp, h)
+        test_pairs(tmp, cfg)
         test_anomaly(tmp, h, cfg)
     print("\nALL FX SMOKE CHECKS PASSED")

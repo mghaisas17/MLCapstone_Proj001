@@ -24,3 +24,23 @@ an hour.
 **Outputs** go to `results/` and the feature cache to `cache/` (both git-ignored). Every run resumes:
 finished horizons are skipped, so re-running a notebook only computes what is missing. Set
 `QUICK = True` in a notebook to check everything on 2021+ data first (results in `*_quick`).
+
+**More pairs**: section 9 of `vol_fx.ipynb` runs the same experiment on GBP/USD, USD/JPY and AUD/USD
+(results in `results/pairs/<pair>/`; EUR/USD reuses the main run). The first run downloads about 360
+files per pair.
+
+## Notes for the write-up
+
+Conclusions from the EUR/USD run (Oct 2026) to carry into the report. Each holds on both BTC and EUR/USD
+unless noted. Re-check them against the other pairs once section 9 has run.
+
+- **Drop neural networks on signatures.** The MLP on the hourly signature is far worse than Ridge on the
+  same features, on both assets (EUR/USD: −59% at 1 day and −42% at 5 days vs HAR; Ridge −1.2% / −4.6%).
+- **Keep the original channels for the forecasting path.** On EUR/USD the original channels (price, activity,
+  range) beat the time-of-day-adjusted ones (+1.7% vs HAR at 1 day, against −0.0% adjusted and −1.2% adjusted
+  + spread). The adjustment probably removes a pattern the signature could use and HAR cannot.
+- **Don't put signature features in a direction classifier.** Adding them to the HAR logistic model lowers the
+  AUC (0.793 → 0.714 at 1 day, 0.745 → 0.680 at 5 days): about 800 features overfit. Use the volatility
+  forecast as the direction score instead (signature forecast 0.788 / 0.751, HAR forecast 0.793 / 0.754).
+
+The sponsor report is `fx_signature_report.html`.
