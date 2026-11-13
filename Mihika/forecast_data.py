@@ -1328,16 +1328,40 @@ def _dukascopy_point(symbol: str) -> float:
     return 1e3 if "JPY" in symbol.upper() else 1e5
 
 
-def _dukascopy_get(url: str, timeout: int = 60, attempts: int = 5) -> bytes | None:
+_DUKASCOPY = {"session": None, "last": 0.0}
+DUKASCOPY_PAUSE = 0.5  # seconds between requests: Dukascopy rate-limits (HTTP 429) rapid bursts
+_sleep = __import__("time").sleep  # module-level so tests can skip the waits
+
+
+def _dukascopy_get(url: str, timeout: int = 60, attempts: int = 8) -> bytes | None:
     """One Dukascopy file, or None when it does not exist (404 or empty: weekends, the current
-    month). Transient failures are retried with backoff (2, 4, 8, 16 s)."""
+    month). Requests reuse one connection and are spaced DUKASCOPY_PAUSE apart. When the server
+    rate-limits (429) or is busy (503), wait as long as its Retry-After asks, else 15 s, 30 s, ...
+    up to 10 min; other failures are retried with backoff (2, 4, 8, ... s). Finished months are
+    cached, so a re-run resumes where it stopped."""
     import time
 
+    if _DUKASCOPY["session"] is None:
+        _DUKASCOPY["session"] = requests.Session()
     for attempt in range(1, attempts + 1):
+        _sleep(max(0.0, DUKASCOPY_PAUSE - (time.monotonic() - _DUKASCOPY["last"])))
+        _DUKASCOPY["last"] = time.monotonic()
         try:
-            response = requests.get(url, timeout=timeout)
+            response = _DUKASCOPY["session"].get(url, timeout=timeout)
             if response.status_code == 404:
                 return None
+            if response.status_code in (429, 503):
+                if attempt == attempts:
+                    raise RuntimeError(
+                        f"Dukascopy is still rate-limiting (HTTP {response.status_code}) after {attempts} tries "
+                        f"for {url}. Wait 10-15 minutes and re-run: finished months are cached and are not "
+                        "downloaded again.")
+                after = response.headers.get("Retry-After", "")
+                wait = float(after) if after.replace(".", "", 1).isdigit() else min(600.0, 15.0 * 2 ** (attempt - 1))
+                LOGGER.warning("Dukascopy rate limit (HTTP %d), waiting %.0fs [%d/%d]: %s",
+                               response.status_code, wait, attempt, attempts - 1, url)
+                _sleep(wait)
+                continue
             if response.status_code >= 400:
                 raise requests.exceptions.HTTPError(f"HTTP {response.status_code} for {url}")
             return response.content or None
@@ -1346,7 +1370,7 @@ def _dukascopy_get(url: str, timeout: int = 60, attempts: int = 5) -> bytes | No
                 raise
             wait = 2**attempt
             LOGGER.warning("Dukascopy download failed (%s), retrying in %ds: %s", type(exc).__name__, wait, url)
-            time.sleep(wait)
+            _sleep(wait)
     return None
 
 
@@ -1440,7 +1464,7 @@ def fetch_dukascopy_hourly(
     (24 downloads per day), the source already used in forecast_data_fx_local.py."""
     data_dir = _ensure_data_dir(data_dir)
     start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
-    this_month = pd.Timestamp.now(tz="UTC").to_period("M")
+    this_month = pd.Timestamp.now(tz="UTC").tz_localize(None).to_period("M")
     pieces = []
     for month in pd.period_range(start_ts, end_ts, freq="M"):
         path = data_dir / f"{symbol}_1h_{month}.parquet"

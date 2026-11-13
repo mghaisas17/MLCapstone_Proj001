@@ -540,6 +540,40 @@ def test_fx_data(tmp):
     ok("FX data: 22:00 UTC FX days, Dukascopy candle decoding + sanity check, tick fallback, monthly cache")
 
 
+def test_dukascopy_rate_limit():
+    class Resp:
+        def __init__(self, code, content=b"", headers=None):
+            self.status_code, self.content, self.headers = code, content, headers or {}
+
+    class Session:
+        def __init__(self, replies):
+            self.replies, self.calls = list(replies), 0
+
+        def get(self, url, timeout=None):
+            self.calls += 1
+            return self.replies.pop(0)
+
+    waits = []
+    real_sleep, real_state = fd._sleep, dict(fd._DUKASCOPY)
+    fd._sleep = waits.append
+    try:
+        fd._DUKASCOPY["session"] = Session([Resp(429, headers={"Retry-After": "3"}), Resp(429), Resp(200, b"data")])
+        assert fd._dukascopy_get("https://example/x.bi5") == b"data"
+        assert 3.0 in waits and 30.0 in waits, waits  # Retry-After honoured, then the 15 s, 30 s schedule
+        fd._DUKASCOPY["session"] = Session([Resp(404)])
+        assert fd._dukascopy_get("https://example/y.bi5") is None
+        fd._DUKASCOPY["session"] = Session([Resp(429)] * 3)
+        try:
+            fd._dukascopy_get("https://example/z.bi5", attempts=3)
+            raise AssertionError("persistent 429 must raise")
+        except RuntimeError as exc:
+            assert "re-run" in str(exc)
+    finally:
+        fd._sleep = real_sleep
+        fd._DUKASCOPY.update(real_state)
+    ok("Dukascopy downloads wait out rate limits (Retry-After, then 15 s, 30 s, ...), 404 = missing, clear error")
+
+
 def test_fx_pipeline(tmp):
     import json
 
@@ -803,5 +837,6 @@ if __name__ == "__main__":
         dd = test_drawdown_pipeline(tmp)
         test_interpretation_figures(tmp, dd)
         test_fx_data(tmp)
+        test_dukascopy_rate_limit()
         test_fx_pipeline(tmp)
     print("\nALL SMOKE CHECKS PASSED")
