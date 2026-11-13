@@ -563,6 +563,18 @@ def make_base_path(window: pd.DataFrame, dims: Iterable[str]) -> np.ndarray:
         hl = np.log(window["high"].to_numpy() / window["low"].to_numpy())
         coordinates.append(np.cumsum(hl))
 
+    # FX channels from fx_hourly_channels (time-of-day adjusted, past data only)
+    if "price_sa" in dims:  # log price rebuilt from adjusted returns (the first bar's return is before the window)
+        r = window["ret_sa"].to_numpy(float)
+        coordinates.append(np.concatenate([[0.0], np.cumsum(r[1:])]))
+
+    if "range_sa" in dims:
+        coordinates.append(np.cumsum(window["range_sa"].to_numpy(float)))
+
+    if "spread" in dims:  # running mean of the abnormal log spread: rises while spreads are unusually wide
+        sp = window["spread_sa"].to_numpy(float)
+        coordinates.append(np.cumsum(sp) / len(sp))
+
     if "stress" in dims:
         if "stress_prob" not in window.columns:
             raise ValueError("'stress' dimension requires a stress_prob column (see anomaly_flag.py).")
@@ -1399,8 +1411,10 @@ def _candles_look_valid(c: pd.DataFrame) -> bool:
     return bool(ok.mean() > 0.99)
 
 
-def _mid_hourly_from_candles(symbol: str, month: pd.Period) -> pd.DataFrame | None:
-    """Mid-price hourly bars for a month from Dukascopy's BID and ASK hourly candle files, or None."""
+def _mid_hourly_from_candles(symbol: str, month: pd.Period, spread: bool = False) -> pd.DataFrame | None:
+    """Mid-price hourly bars for a month from Dukascopy's BID and ASK hourly candle files, or None.
+    With ``spread``, also the hour's relative bid-ask spread: (ask - bid) / mid, averaged over the
+    hour's open and close quotes."""
     start = pd.Timestamp(month.start_time, tz="UTC")
     point = _dukascopy_point(symbol)
     sides = {}
@@ -1415,12 +1429,14 @@ def _mid_hourly_from_candles(symbol: str, month: pd.Period) -> pd.DataFrame | No
     bid, ask = sides["BID"].align(sides["ASK"], join="inner")
     mid = (bid[["open", "high", "low", "close"]] + ask[["open", "high", "low", "close"]]) / 2
     mid["volume"] = bid["volume"] + ask["volume"]
+    if spread:
+        mid["spread"] = 0.5 * ((ask["open"] - bid["open"]) / mid["open"] + (ask["close"] - bid["close"]) / mid["close"])
     return mid[mid["volume"] > 0]  # flat zero-volume hours are the closed market
 
 
-def _mid_hourly_from_ticks(symbol: str, day: pd.Timestamp) -> pd.DataFrame:
+def _mid_hourly_from_ticks(symbol: str, day: pd.Timestamp, spread: bool = False) -> pd.DataFrame:
     """Fallback: one UTC day of mid-price hourly bars from Dukascopy's hourly tick files
-    (the decoder from forecast_data_fx_local.py)."""
+    (the decoder from forecast_data_fx_local.py). With ``spread``, also the mean relative spread."""
     import lzma
 
     point = _dukascopy_point(symbol)
@@ -1434,11 +1450,14 @@ def _mid_hourly_from_ticks(symbol: str, day: pd.Timestamp) -> pd.DataFrame:
         if not len(rec):
             continue
         mid = (rec["bid"] + rec["ask"]) / (2 * point)
-        rows.append({"timestamp": hour, "open": mid[0], "high": mid.max(), "low": mid.min(), "close": mid[-1],
-                     "volume": float(rec["bid_vol"].sum() + rec["ask_vol"].sum())})
+        row = {"timestamp": hour, "open": mid[0], "high": mid.max(), "low": mid.min(), "close": mid[-1],
+               "volume": float(rec["bid_vol"].sum() + rec["ask_vol"].sum())}
+        if spread:
+            row["spread"] = float(np.mean((rec["ask"].astype(float) - rec["bid"]) / (point * mid)))
+        rows.append(row)
     if not rows:
-        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"],
-                            index=pd.DatetimeIndex([], tz="UTC", name="timestamp"))
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"] + (["spread"] if spread else []),
+                            index=pd.DatetimeIndex([], tz="UTC", name="timestamp"), dtype=float)
     return pd.DataFrame(rows).set_index("timestamp")
 
 
@@ -1458,9 +1477,14 @@ def fetch_dukascopy_hourly(
     symbol: str = "EURUSD",
     data_dir: str | Path = "data/dukascopy",
     force_download: bool = False,
+    spread: bool = False,
 ) -> pd.DataFrame:
     """Hourly mid-price OHLC + quote volume for an FX pair, cached per month. Only trading hours
     are kept (no weekend bars), so windows counted in bars are windows of trading time.
+
+    ``spread=True`` adds the relative bid-ask spread of each hour (column ``spread``). Those months
+    are cached separately (``*_1h_ba_*``), so the mid-only cache other runs use is left untouched;
+    the mid prices are the same in both.
 
     Each month comes from Dukascopy's hourly candle files (2 downloads). If those are missing (the
     current month) or fail the sanity check, the month is built from the hourly tick files instead
@@ -1470,18 +1494,19 @@ def fetch_dukascopy_hourly(
     this_month = pd.Timestamp.now(tz="UTC").tz_localize(None).to_period("M")
     pieces = []
     for month in pd.period_range(start_ts, end_ts, freq="M"):
-        path = data_dir / f"{symbol}_1h_{month}.parquet"
+        path = data_dir / f"{symbol}_1h_{'ba_' if spread else ''}{month}.parquet"
         if path.exists() and not force_download:
             pieces.append(pd.read_parquet(path))
             continue
         LOGGER.info("Dukascopy %s %s (hourly)", symbol, month)
-        bars = _mid_hourly_from_candles(symbol, month)
+        bars = _mid_hourly_from_candles(symbol, month, spread)
         if bars is None:
             days = pd.date_range(pd.Timestamp(month.start_time, tz="UTC"),
                                  min(pd.Timestamp(month.end_time, tz="UTC").normalize(),
                                      pd.Timestamp(end_ts, tz="UTC")), freq="D")
-            parts = [_mid_hourly_from_ticks(symbol, d) for d in days if d.weekday() != 5]
-            bars = pd.concat(parts) if parts else None
+            parts = [_mid_hourly_from_ticks(symbol, d, spread) for d in days if d.weekday() != 5]
+            parts = [p for p in parts if len(p)]  # empty days (holidays) would turn every column to object
+            bars = pd.concat(parts).astype(float) if parts else None
         if bars is None or bars.empty:
             LOGGER.warning("No Dukascopy data for %s %s", symbol, month)
             continue
@@ -1495,6 +1520,48 @@ def fetch_dukascopy_hourly(
     bars = bars[~bars.index.duplicated(keep="last")]
     lo, hi = pd.Timestamp(start_ts, tz="UTC"), pd.Timestamp(end_ts, tz="UTC") + pd.Timedelta(days=1)
     return validate_ohlc(bars.loc[(bars.index >= lo) & (bars.index < hi)])
+
+
+FX_SESSION_TZ = "America/New_York"  # FX sessions are fixed in New York time, so DST does not move them
+
+
+def fx_hourly_channels(hourly: pd.DataFrame, weeks: int = 52, min_weeks: int = 8) -> pd.DataFrame:
+    """Add the time-of-day-adjusted FX channels to hourly bars, using only past data.
+
+    FX volatility and spreads follow the clock (Asia, London, New York, the 17:00 New York
+    rollover), so each hour is compared with the same hour of the week (in New York time) over the
+    previous ``weeks`` weeks. Each estimate uses only earlier bars, so the columns can be computed
+    once over the whole history with no look-ahead. Until a slot has ``min_weeks`` earlier
+    observations there is no adjustment (factor 1).
+
+    * ``ret_sa``: log return / (that slot's mean |return| / the mean |return| of all slots). The
+      level of volatility is kept; only its intraday shape is removed.
+    * ``range_sa``: log(high / low), adjusted the same way.
+    * ``spread_sa``: log(spread) minus that slot's mean log spread: 0 = a normal spread for that
+      hour, > 0 = wider than usual (clipped to +-3). Needs a ``spread`` column.
+    """
+    h = hourly.copy()
+    idx = pd.DatetimeIndex(h.index)
+    local = (idx.tz_localize("UTC") if idx.tz is None else idx).tz_convert(FX_SESSION_TZ)
+    slot = pd.Series(local.dayofweek * 24 + local.hour, index=h.index)
+    per_week = max(1, int(round(len(h) / max(1.0, (idx[-1] - idx[0]) / pd.Timedelta(weeks=1)))))
+
+    def past_slot_mean(x: pd.Series) -> pd.Series:
+        return x.groupby(slot).transform(lambda v: v.shift(1).rolling(weeks, min_periods=min_weeks).mean())
+
+    def factor(x: pd.Series) -> pd.Series:
+        overall = x.shift(1).rolling(weeks * per_week, min_periods=min_weeks * per_week).mean()
+        f = past_slot_mean(x) / overall
+        return f.where(np.isfinite(f) & (f > 0)).fillna(1.0).clip(0.2, 5.0)
+
+    r = np.log(h["close"]).diff().fillna(0.0)
+    hl = np.log(h["high"] / h["low"]).clip(lower=0.0)
+    h["ret_sa"] = r / factor(r.abs())
+    h["range_sa"] = hl / factor(hl)
+    if "spread" in h.columns:
+        ls = np.log(h["spread"].clip(lower=1e-7))
+        h["spread_sa"] = (ls - past_slot_mean(ls)).fillna(0.0).clip(-3.0, 3.0)
+    return h
 
 
 def fx_daily_from_hourly(hourly: pd.DataFrame, min_hours: int = 20) -> pd.DataFrame:

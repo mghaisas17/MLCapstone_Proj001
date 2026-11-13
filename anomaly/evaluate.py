@@ -111,5 +111,8 @@ def reorder_injection(win: dict, rows_idx: np.ndarray, seed: int = 0) -> tuple[d
     injected = np.zeros(len(rows_idx), bool)
     injected[rng.permutation(len(rows_idx))[: len(rows_idx) // 2]] = True
     for j in np.where(injected)[0]:
-        sub["r"][j] = np.sort(sub["r"][j])[:: (1 if rng.random() < 0.5 else -1)]
+        order = np.argsort(sub["r"][j], kind="stable")[:: (1 if rng.random() < 0.5 else -1)]
+        for k in ("r", "r_sa"):  # the adjusted return of a bar moves with its raw return
+            if k in sub:
+                sub[k][j] = sub[k][j][order]
     return sub, injected

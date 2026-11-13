@@ -50,6 +50,7 @@ from forecast_data import (
     fetch_dukascopy_hourly,
     future_drawdown_targets,
     fx_daily_from_hourly,
+    fx_hourly_channels,
     load_or_download_yahoo,
 )
 from models_and_metrics import (
@@ -107,6 +108,9 @@ class ExperimentConfig:
     asset: str = "crypto"
     fx_symbol: str = "EURUSD"
     fx_start: str = "2012-01-01"
+    # FX only: also load the bid-ask spread and add the time-of-day-adjusted channels
+    # (forecast_data.fx_hourly_channels), which the path dims price_sa / range_sa / spread need.
+    fx_channels: bool = False
     horizons: tuple = MAIN_HORIZONS
     n_folds: int = 3
     min_train_rows: int = 50
@@ -160,6 +164,9 @@ class ExperimentConfig:
     # ablations (signature level / augmentation / dimensions), same folds
     run_ablations: bool = True
     ablation_models: tuple = ("Ridge | signature",)
+    # Ablations on the intraday (*_i) horizons: {setting name: intraday path dims}. Empty = none.
+    # They use "Ridge | intraday signature" and also run the signature-level and augmentation checks.
+    intraday_ablation_dims: dict = field(default_factory=dict)
 
     # HMM anomaly flag (see anomaly_flag.py), added as an input to the forecasts
     use_flag: bool = True
@@ -523,7 +530,10 @@ def _anomaly_scores(ctx, which: str) -> np.ndarray:
     if cache_key not in ctx.flag_cache:
         end = acfg.end or cfg.intraday_end or cfg.yahoo_end or str(pd.Timestamp.now(tz="UTC").date())
         if acfg.asset == "fx":
-            bars = fetch_dukascopy_hourly(acfg.start, end, symbol=acfg.symbol, data_dir=Path(acfg.data_dir) / "dukascopy")
+            channels = getattr(acfg, "fx_channels", False)
+            bars = fetch_dukascopy_hourly(acfg.start, end, symbol=acfg.symbol, data_dir=Path(acfg.data_dir) / "dukascopy",
+                                          spread=channels)
+            bars = fx_hourly_channels(bars) if channels else bars
         else:
             bars = fetch_binance_klines_hourly(acfg.start, end, symbol=cfg.symbol,
                                                data_dir=Path(acfg.data_dir) / "klines", freq=spec.bar_freq)
@@ -817,13 +827,14 @@ def load_intraday(cfg: ExperimentConfig) -> pd.DataFrame:
     Dukascopy for FX (where they are also the source of the daily bars)."""
     end = cfg.intraday_end or cfg.yahoo_end or str(pd.Timestamp.now(tz="UTC").date())
     if cfg.asset == "fx":
-        key = ("fx", cfg.fx_symbol, cfg.fx_start, end)
+        key = ("fx", cfg.fx_symbol, cfg.fx_start, end, cfg.fx_channels)
         if key not in _INTRADAY_MEMO:
             _INTRADAY_MEMO.clear()
-            _INTRADAY_MEMO[key] = fetch_dukascopy_hourly(
+            bars = fetch_dukascopy_hourly(
                 cfg.fx_start, end, symbol=cfg.fx_symbol, data_dir=Path(cfg.data_dir) / "dukascopy",
-                force_download=cfg.force_download,
+                force_download=cfg.force_download, spread=cfg.fx_channels,
             )
+            _INTRADAY_MEMO[key] = fx_hourly_channels(bars) if cfg.fx_channels else bars
         return _INTRADAY_MEMO[key]
     key = (cfg.symbol, cfg.intraday_start, end)
     if key not in _INTRADAY_MEMO:
@@ -862,7 +873,7 @@ def base_spec_for(horizon: str, bars: pd.DataFrame, cfg: ExperimentConfig) -> Fo
     unknown = set(overrides) - {f for f in ForecastSpec.__dataclass_fields__ if f not in ("name", "sample_stride")}
     if unknown:
         raise ValueError(f"Unknown or unsupported spec override(s) for {horizon}: {sorted(unknown)}")
-    for k in ("dims", "har_windows"):  # JSON round trips turn tuples into lists
+    for k in ("dims", "har_windows", "intraday_dims"):  # JSON round trips turn tuples into lists
         if k in overrides:
             overrides[k] = tuple(overrides[k])
     if "stress" in overrides.get("dims", ()):
@@ -1017,6 +1028,40 @@ def run_ablations(bars, base_spec, base_ds, folds, horizon_key, horizon_steps, c
     return pd.concat(frames, ignore_index=True)
 
 
+INTRADAY_ABLATION_MODEL = "Ridge | intraday signature"
+
+
+def run_intraday_ablations(bars, intraday, base_spec, base_ds, folds, horizon_key, horizon_steps, cfg):
+    """The ablations for the *_i horizons, on the intraday signature (same rows and folds): signature
+    levels, augmentation, and each path-dims setting in ``cfg.intraday_ablation_dims``."""
+    frames = []
+    ispec = replace(base_spec, dims=tuple(base_spec.intraday_dims or base_spec.dims))
+
+    def run(ds, experiment, setting):
+        m, _ = evaluate_models(ds, folds, horizon_key, horizon_steps, cfg, (INTRADAY_ABLATION_MODEL,),
+                               experiment=experiment, setting=setting, keep_predictions=False)
+        frames.append(m)
+
+    for setting, sl in signature_level_slices(ispec).items():
+        run(replace(base_ds, X_isig=base_ds.X_isig[:, sl]), "Signature level", setting)
+    settings = [("Augmentation", "Raw path", dict(lead_lag=False, time_aug=False)),
+                ("Augmentation", "Time", dict(lead_lag=False, time_aug=True)),
+                ("Augmentation", "Lead-lag + time", {})]
+    settings += [("Channels", name, dict(intraday_dims=tuple(dims))) for name, dims in cfg.intraday_ablation_dims.items()]
+    for experiment, setting, changes in settings:
+        if not changes or changes.get("intraday_dims") == tuple(ispec.dims):
+            run(base_ds, experiment, setting)
+            continue
+        ds = get_dataset(bars, replace(base_spec, **changes), cfg, include_seq=False,
+                         sub_window=per_horizon(cfg.lstm_sub_window, horizon_key), intraday=intraday)
+        if len(ds.times) != len(base_ds.times) or not (ds.times == base_ds.times).all():
+            raise RuntimeError("Ablation rows differ from the base dataset; folds would not match.")
+        run(ds, experiment, setting)
+        del ds
+        gc.collect()
+    return pd.concat(frames, ignore_index=True)
+
+
 # --------------------------------------------------------------------------
 # Orchestration
 # --------------------------------------------------------------------------
@@ -1112,6 +1157,9 @@ def run_horizon(horizon: str, cfg: ExperimentConfig) -> Path:
 
     if cfg.run_ablations and intraday is None and cfg.target == "vol":
         ablations = run_ablations(bars, spec, ds, folds, horizon, horizon_steps, cfg, returns)
+        ablations.to_csv(out / "ablations.csv", index=False)
+    if cfg.run_ablations and intraday is not None and cfg.intraday_ablation_dims and cfg.target == "vol":
+        ablations = run_intraday_ablations(bars, intraday, spec, ds, folds, horizon, horizon_steps, cfg)
         ablations.to_csv(out / "ablations.csv", index=False)
 
     meta = {

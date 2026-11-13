@@ -42,7 +42,13 @@ CHANNEL_SETS = {
     "price": ("price",),
     "price+volume": ("price", "activity"),
     "price+volume+range+flow": ("price", "activity", "range", "flow"),
+    # FX channels (need AnomalyConfig.fx_channels): time-of-day-adjusted price and range, and the
+    # abnormal bid-ask spread (see forecast_data.fx_hourly_channels)
+    "price_sa": ("price_sa",),
+    "price_sa+spread": ("price_sa", "spread"),
+    "price_sa+volume+range_sa+spread": ("price_sa", "activity", "range_sa", "spread"),
 }
+ORIGINAL_CHANNEL_SETS = ("price", "price+volume", "price+volume+range+flow")
 
 # Labeled crises (from Aayush/configs/horizons.yaml), used only for the timeline case study.
 FX_EVENTS = {
@@ -83,10 +89,13 @@ class AnomalyConfig:
     start: str = "2017-08-01"
     end: str | None = None  # None -> today
     symbol: str = "BTCUSDT"
+    # FX only: also load the bid-ask spread and the time-of-day-adjusted channels, which the
+    # price_sa / range_sa / spread channel sets need
+    fx_channels: bool = False
     target_rows: dict = field(default_factory=lambda: {"1h": 20000, "1d": None, "7d": None})
 
     # Stage A grid (cheap detectors)
-    channel_sets: tuple = tuple(CHANNEL_SETS)
+    channel_sets: tuple = ORIGINAL_CHANNEL_SETS
     normalizations: tuple = ("none", "trailing_vol")
     window_mults: tuple = (0.5, 1.0, 2.0)
     lead_lag: tuple = (True, False)

@@ -43,7 +43,7 @@ from .config import CHANNEL_SETS, AnomalyConfig, RepConfig, horizon_specs
 from .evaluate import block_bootstrap_diff, fold_labels, reorder_injection, score_metrics
 from .features import build_rows, extract_windows, representations
 from experiment import purged_walk_forward
-from forecast_data import fetch_binance_klines_hourly, fetch_dukascopy_hourly
+from forecast_data import fetch_binance_klines_hourly, fetch_dukascopy_hourly, fx_hourly_channels
 
 LOGGER = logging.getLogger(__name__)
 SIGNATURE = "signature"
@@ -54,7 +54,9 @@ def load_bars(spec, cfg: AnomalyConfig) -> pd.DataFrame:
     if cfg.asset == "fx":  # trading hours only: windows in bars are windows of trading time
         if spec.bar_freq != "1h":
             raise ValueError("FX anomaly horizons use hourly bars.")
-        return fetch_dukascopy_hourly(cfg.start, end, symbol=cfg.symbol, data_dir=Path(cfg.data_dir) / "dukascopy")
+        bars = fetch_dukascopy_hourly(cfg.start, end, symbol=cfg.symbol, data_dir=Path(cfg.data_dir) / "dukascopy",
+                                      spread=cfg.fx_channels)
+        return fx_hourly_channels(bars) if cfg.fx_channels else bars
     return fetch_binance_klines_hourly(cfg.start, end, symbol=cfg.symbol, data_dir=Path(cfg.data_dir) / "klines",
                                        freq=spec.bar_freq)
 

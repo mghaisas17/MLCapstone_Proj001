@@ -73,12 +73,21 @@ def extract_windows(bars: pd.DataFrame, pos: np.ndarray, W: int, normalize: str)
     flow = bars["signed_dollar_flow"].to_numpy(float) if "signed_dollar_flow" in bars else np.zeros(len(bars))
     idx = pos[:, None] + np.arange(-W + 1, 1)
     win = {"r": r[idx], "hl": hl[idx], "dv": dv[idx], "flow": flow[idx]}
+    # FX channels (forecast_data.fx_hourly_channels), when present
+    extra = {k: bars[c].to_numpy(float) for k, c in (("r_sa", "ret_sa"), ("hl_sa", "range_sa"), ("spread", "spread_sa"))
+             if c in bars.columns}
+    win.update({k: v[idx] for k, v in extra.items()})
     if normalize == "trailing_vol":
         prev = pos[:, None] + np.arange(-2 * W + 1, -W + 1)
         sigma = np.sqrt(np.mean(r[prev] ** 2, axis=1, keepdims=True))
         sigma = np.maximum(sigma, 1e-6)
         win["r"] = np.clip(win["r"] / sigma, -50, 50)
         win["hl"] = np.clip(win["hl"] / np.maximum(hl[prev].mean(axis=1, keepdims=True), 1e-6), 0, 50)
+        if "r_sa" in win:  # the spread channel is already relative (log spread vs its usual level)
+            sig_sa = np.maximum(np.sqrt(np.mean(extra["r_sa"][prev] ** 2, axis=1, keepdims=True)), 1e-6)
+            win["r_sa"] = np.clip(win["r_sa"] / sig_sa, -50, 50)
+            mean_hl = np.maximum(extra["hl_sa"][prev].mean(axis=1, keepdims=True), 1e-6)
+            win["hl_sa"] = np.clip(win["hl_sa"] / mean_hl, 0, 50)
     elif normalize != "none":
         raise ValueError(f"unknown normalize={normalize!r}")
     return win
@@ -103,6 +112,11 @@ def base_paths(win: dict, channels: tuple, path_points: int) -> np.ndarray:
             inc = win["hl"]
         elif c == "flow":
             inc = _share(win["flow"], total_dv)
+        elif c in ("price_sa", "range_sa", "spread"):
+            key = {"price_sa": "r_sa", "range_sa": "hl_sa", "spread": "spread"}[c]
+            if key not in win:
+                raise ValueError(f"channel {c!r} needs the FX channels (AnomalyConfig.fx_channels=True)")
+            inc = win[key] / W if c == "spread" else win[key]
         else:
             raise ValueError(f"unknown channel {c!r}")
         cols.append(np.concatenate([zero, np.cumsum(inc, axis=1)], axis=1))
@@ -195,6 +209,7 @@ def raw(win: dict, channels: tuple, blocks: int = 32) -> np.ndarray:
         "price": win["r"], "range": win["hl"],
         "activity": np.where(total_dv > 0, _share(win["dv"], total_dv), 1.0 / W),
         "flow": _share(win["flow"], total_dv),
+        **{c: win[k] for c, k in (("price_sa", "r_sa"), ("range_sa", "hl_sa"), ("spread", "spread")) if k in win},
     }
     cols = [np.add.reduceat(series[c], edges[:-1], axis=1) for c in channels]
     return np.concatenate(cols, axis=1).astype(np.float32)

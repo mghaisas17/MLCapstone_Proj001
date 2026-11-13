@@ -546,6 +546,28 @@ def test_fx_data(tmp):
     assert len(april) == 24 and np.isclose(april["high"].iloc[0], (108_012 + 108_010) / 2e5), "tick fallback"
     assert {"dollar_volume", "signed_dollar_flow"} <= set(bars.columns)
     assert (tmp / "duka" / "EURUSD_1h_2024-03.parquet").exists()
+
+    # spread=True: ASK candles 2 points above BID; ticks 2 points apart; cached under *_1h_ba_*
+    ask_rec = rec.copy()
+    for col in ("open", "close", "low", "high"):
+        ask_rec[col] += 2
+    ask_blob = lzma.compress(ask_rec.tobytes())
+
+    def fake_get_ba(url, **k):
+        if "candles_hour" in url:
+            return (ask_blob if "ASK_" in url else blob) if "/2024/02/" in url else None
+        return tick_blob if "/2024/03/01/" in url else None
+    fd._dukascopy_get = fake_get_ba
+    try:
+        ba = fd.fetch_dukascopy_hourly("2024-03-01", "2024-04-02", data_dir=tmp / "duka", spread=True)
+    finally:
+        fd._dukascopy_get = real
+    m_ba, a_ba = ba[ba.index < pd.Timestamp("2024-04-01", tz="UTC")], ba[ba.index >= pd.Timestamp("2024-04-01", tz="UTC")]
+    assert np.allclose(m_ba["close"].astype(float), march["close"].astype(float) + 1e-5), "candle mid moves by 1 point"
+    assert np.allclose(a_ba["close"].astype(float), april["close"].astype(float)), "tick mid unchanged"
+    assert np.allclose(m_ba["spread"], 2e-5 / m_ba["close"], rtol=1e-3), "candle spread = (ask - bid) / mid"
+    assert np.allclose(a_ba["spread"], 2e-5 / a_ba["close"], rtol=1e-3), "tick spread = mean (ask - bid) / mid"
+    assert (tmp / "duka" / "EURUSD_1h_ba_2024-03.parquet").exists(), "spread months have their own cache files"
     ok("FX data: 22:00 UTC FX days, Dukascopy candle decoding + sanity check, tick fallback, monthly cache")
 
 
