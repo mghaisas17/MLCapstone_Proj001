@@ -1319,6 +1319,9 @@ FX_DAY_START = pd.Timedelta(hours=-2)
 DUKASCOPY_URL = "https://datafeed.dukascopy.com/datafeed"
 # Hourly candle record: seconds from the start of the month, open, close, low, high (integer
 # points), volume -- big-endian, like the tick files decoded in forecast_data_fx_local.py.
+# One file per month at {symbol}/{year}/{month-1:02d}/{BID|ASK}_candles_hour_1.bi5 with a record for
+# every hour of the month (flat, zero-volume ones when closed). Checked against the live server for
+# EURUSD Jan 2024: 744 records, OHLC and volume equal to bars built from the hourly tick files.
 DUKASCOPY_CANDLE = np.dtype([("sec", ">u4"), ("open", ">u4"), ("close", ">u4"), ("low", ">u4"), ("high", ">u4"),
                              ("vol", ">f4")])
 DUKASCOPY_TICK = np.dtype([("ms", ">u4"), ("ask", ">u4"), ("bid", ">u4"), ("ask_vol", ">f4"), ("bid_vol", ">f4")])

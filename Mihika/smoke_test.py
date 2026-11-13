@@ -513,6 +513,15 @@ def test_fx_data(tmp):
     assert c.index[1] == t0 + pd.Timedelta(hours=1) and np.isclose(c["open"].iloc[0], 1.08) and fd._candles_look_valid(c)
     swapped = c.rename(columns={"low": "high", "high": "low"})
     assert not fd._candles_look_valid(swapped), "a misread field order must fail the sanity check"
+    # Real records (EURUSD 2024-01-15 10:00 UTC) from the Jan 2024 BID/ASK hourly candle files;
+    # the synthetic records above round-trip our own dtype, these pin it to Dukascopy's layout.
+    # OHLC and volume equal those built from that hour's tick file (2024/00/15/10h_ticks.bi5).
+    jan = pd.Timestamp("2024-01-01", tz="UTC")
+    for raw, ohlcv in (("001301a00001ab990001ab580001ab170001ab9a465df1ec", (1.09465, 1.09466, 1.09335, 1.09400, 14204.48)),
+                       ("001301a00001ab9d0001ab5a0001ab180001ab9e46462dae", (1.09469, 1.09470, 1.09336, 1.09402, 12683.42))):
+        r = fd.decode_dukascopy_candles(lzma.compress(bytes.fromhex(raw)), jan, 1e5)
+        assert r.index[0] == pd.Timestamp("2024-01-15 10:00", tz="UTC"), "candle seconds count from the month start"
+        assert np.allclose(r[["open", "high", "low", "close", "volume"]].iloc[0].to_numpy(), ohlcv), "real candle layout"
 
     tick = np.zeros(3, dtype=fd.DUKASCOPY_TICK)
     tick["ask"], tick["bid"] = [108_002, 108_012, 108_007], [108_000, 108_010, 108_005]
