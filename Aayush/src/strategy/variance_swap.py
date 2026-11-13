@@ -91,6 +91,38 @@ def build_variance_series(ohlcv_csv: str, anomaly_csv: str, cfg: VarSwapConfig) 
     return df.reset_index(drop=True)
 
 
+def build_variance_series_dvol_ffill(ohlcv_csv: str, anomaly_csv: str, dvol_hourly_csv: str,
+                                        periods_per_year: int) -> pd.DataFrame:
+    """A real-strike variant for a horizon FINER than DVOL's own resolution
+    (e.g. 5-min bars, where Deribit's volatility-index endpoint only
+    reliably returns data at hourly resolution or coarser). DVOL doesn't
+    move fast enough within an hour for this to lose much: every bar
+    inside hour H uses hour (H-1)'s DVOL close as its strike -- the same
+    lagged value every hourly bar in H would use, just broadcast across
+    that hour's finer bars instead of computed once per hour."""
+    px = pd.read_csv(ohlcv_csv, parse_dates=["date"])
+    px["date"] = pd.to_datetime(px["date"], utc=True).dt.tz_localize(None)
+    px = px.sort_values("date").reset_index(drop=True)
+    px["realized_var"] = parkinson_variance(px["high"], px["low"])
+    px["log_return"] = np.log(px["close"]).diff()
+    px["hour"] = px["date"].dt.floor("h")
+
+    dvol = pd.read_csv(dvol_hourly_csv, parse_dates=["date"])
+    dvol["date"] = pd.to_datetime(dvol["date"], utc=True).dt.tz_localize(None)
+    dvol["implied_var"] = (dvol["close"] / 100.0) ** 2 / periods_per_year
+    dvol["strike_var"] = dvol["implied_var"].shift(1)  # (H-1)'s close -- known throughout hour H
+
+    an = pd.read_csv(anomaly_csv, parse_dates=["date"])
+    an["date"] = pd.to_datetime(an["date"], utc=True).dt.tz_localize(None)
+
+    df = px.merge(dvol[["date", "strike_var"]].rename(columns={"date": "hour"}), on="hour", how="inner")
+    df = df.merge(an[["date", "flag"]], on="date", how="left").drop(columns="hour")
+    df = df.dropna(subset=["realized_var", "strike_var"])
+    df["flag"] = df["flag"].fillna(0).astype(int)
+    df["flag_lag"] = df["flag"].shift(1).fillna(0).astype(int)
+    return df.reset_index(drop=True)
+
+
 def fit_vol_terciles(df: pd.DataFrame) -> tuple[float, float]:
     q1, q2 = np.nanquantile(df["strike_var"], [1 / 3, 2 / 3])
     return float(q1), float(q2)
