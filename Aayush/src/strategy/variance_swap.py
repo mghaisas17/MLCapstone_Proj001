@@ -96,6 +96,44 @@ def fit_vol_terciles(df: pd.DataFrame) -> tuple[float, float]:
     return float(q1), float(q2)
 
 
+def build_variance_series_vix(ohlcv_csv: str, anomaly_csv: str, vix_csv: str, cfg: VarSwapConfig,
+                                 periods_per_year: int = 252) -> pd.DataFrame:
+    """Same shape as build_variance_series, but the "strike" is a REAL
+    market-quoted implied variance (VIX) instead of our own trailing-average
+    proxy -- the upgrade equities make possible, since BTC has no equivalent
+    liquid, publicly-quoted volatility index.
+
+    VIX is published as an annualized volatility in percentage points (e.g.
+    "20" = 20% annualized); converting to this series' own period units
+    (daily, to match the Parkinson realized-variance estimate) is
+    `(VIX/100)^2 / periods_per_year`. VIX is itself forward-looking (next
+    ~30 calendar days), so unlike the BTC proxy this strike needs no
+    trailing-window/lag construction of our own -- it already IS the
+    market's own forecast, known at the close of the previous day."""
+    px = pd.read_csv(ohlcv_csv, parse_dates=["date"])
+    px["date"] = pd.to_datetime(px["date"], utc=True).dt.tz_localize(None)
+    px = px.sort_values("date").reset_index(drop=True)
+    px["realized_var"] = parkinson_variance(px["high"], px["low"])
+    px["log_return"] = np.log(px["close"]).diff()
+
+    vix = pd.read_csv(vix_csv, parse_dates=["date"])
+    vix["date"] = pd.to_datetime(vix["date"], utc=True).dt.tz_localize(None)
+    vix["implied_var"] = (vix["close"] / 100.0) ** 2 / periods_per_year
+    # Use YESTERDAY's VIX close as today's strike -- known at t-1, no look-ahead,
+    # same convention as every other lagged feature in this project.
+    vix["strike_var"] = vix["implied_var"].shift(1)
+
+    an = pd.read_csv(anomaly_csv, parse_dates=["date"])
+    an["date"] = pd.to_datetime(an["date"], utc=True).dt.tz_localize(None)
+    an = an[["date", "flag"]]
+
+    df = px.merge(vix[["date", "strike_var"]], on="date", how="left").merge(an, on="date", how="left")
+    df = df.dropna(subset=["realized_var", "strike_var"])
+    df["flag"] = df["flag"].fillna(0).astype(int)
+    df["flag_lag"] = df["flag"].shift(1).fillna(0).astype(int)
+    return df.reset_index(drop=True)
+
+
 def rule_based_weights(df: pd.DataFrame, vol_terciles: tuple[float, float],
                         w_flagged: float = 1.0, w_calm: float = 0.0, w_mid: float = 0.0) -> np.ndarray:
     """The actual rule (no RL): go long variance when flagged (bet realized

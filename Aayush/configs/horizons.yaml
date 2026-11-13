@@ -191,11 +191,15 @@ short_horizon_reference_periods:
 
 # Continuous block used to SCORE the short horizons uniformly -- not
 # restricted to the 5 labeled macro events, so genuine anomalies anywhere in
-# this window (not just inside a named crisis) can be found. Also happens to
-# contain 5 of the 8 calm periods above (2024-2026), pulled once as one
-# continuous fetch rather than as separate islands.
+# this window (not just inside a named crisis) can be found. Extended back to
+# 2018-08-13 (Binance's earliest usable history, matching the first calm
+# period above) rather than starting at 2023-09-25: the original window
+# never contained a real crisis (Terra/Luna 2022-05, FTX 2022-11), so the
+# variance-swap backtests built on it had no chance to observe a genuinely
+# bad regime, only a good one. Also happens to contain 6 of the 8 calm
+# periods above, pulled once as one continuous fetch rather than as islands.
 short_horizon_scoring_period:
-  start: "2023-09-25"
+  start: "2018-08-13"
   end: "2026-09-25"
 
 events:
