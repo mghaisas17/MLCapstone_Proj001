@@ -141,6 +141,62 @@ def test_pairs(tmp: Path, cfg: ex.ExperimentConfig):
     ok("more pairs: per-pair runs and direction, cross-pair level / test / direction tables, figure")
 
 
+def test_cross(tmp: Path, h: pd.DataFrame, cfg: ex.ExperimentConfig):
+    """Pairs together: other pairs' prices and the dollar factor in the path, three runs merged."""
+    rng = np.random.default_rng(7)
+
+    def fake(*a, symbol="EURUSD", **k):  # each pair: the synthetic bars times its own random walk
+        if symbol == "EURUSD":
+            return h
+        walk = np.exp(np.cumsum(rng.normal(0, 1e-3, len(h))))
+        out = h.copy()
+        for c in ("open", "high", "low", "close"):
+            out[c] = h[c] * walk * (100 if "JPY" in symbol else 1)
+        return out.iloc[3:]  # a slightly different calendar: the first hours are missing
+
+    # the channels: past data only, dollar sign convention, path dims
+    others = {s: fake(symbol=s) for s in ("GBPUSD", "USDJPY")}
+    c = fd.fx_cross_channels(h, "EURUSD", others)
+    assert np.allclose(c["lclose__USDJPY"].dropna(), np.log(others["USDJPY"].close).reindex(c.index).dropna())
+    assert c["lclose__GBPUSD"].iloc[:3].isna().all() and c["usd_log"].notna().all()
+    r = np.log(h.close).diff()
+    m = pd.concat([-r, -c["lclose__GBPUSD"].diff(), c["lclose__USDJPY"].diff()], axis=1).mean(axis=1)
+    assert np.allclose(c.usd_log.diff().iloc[5:], m.iloc[5:])
+    assert fd.usd_side("USDJPY") == 1 and fd.usd_side("AUDUSD") == -1 and fd.usd_side("EURGBP") == 0
+    path = fd.make_base_path(c.iloc[:30], ("price", "activity", "range", "x:GBPUSD", "x:USDJPY", "usd"))
+    assert path.shape == (30, 6) and np.isfinite(path).all() and np.allclose(path[0, 3:], 0)
+    assert L.cross_dims("EURUSD", "pairs") == L.OWN_DIMS + ("x:GBPUSD", "x:USDJPY", "x:AUDUSD")
+
+    saved = ex.fetch_dukascopy_hourly
+    ex.fetch_dukascopy_hourly = fake
+    try:
+        ex._INTRADAY_MEMO.clear()
+        keep = {k: getattr(cfg, k) for k in ("fx_start", "intraday_end", "torch_epochs", "data_dir", "cache_dir")}
+        cfgs = {}
+        for v in L.CROSS_VARIANTS:
+            pts = {hk: {"intraday_dims": L.cross_dims("EURUSD", v), "intraday_path_points": 24} for hk in L.HORIZONS}
+            cc = L.cross_config("EURUSD", v, output_dir=str(tmp / "cross" / v), spec_overrides=pts, **keep)
+            assert cc.ridge_clip == L.RIDGE_CLIP and (v == "own") == (not cc.cross_pairs)
+            ex.run_all(cc)
+            cfgs[v] = cc
+    finally:
+        ex.fetch_dukascopy_hourly = saved
+    res = L.load_cross({"EURUSD": cfgs})["EURUSD"]
+    assert {"Signature | own pair", "Signature | + dollar factor", "Signature | + other pairs", "HAR-RV-L"} <= set(res.metrics.Model)
+    level = L.cross_level_table({"EURUSD": res})
+    assert level.drop(columns=["Pair", "Horizon"]).notna().all().all()
+    t = L.cross_test_table({"EURUSD": res})
+    assert "Signature | own pair" in set(t.columns.get_level_values(0))
+    plt.close(L.plot_cross(level))
+    assert len(L.worst_errors(res, "Signature | + other pairs", n=3)) == 6
+    # clipping: an extreme test row cannot push the forecast far outside the training range
+    X = rng.normal(size=(300, 5)); y = X[:, 0] + rng.normal(0, .1, 300)
+    t_ = pd.date_range("2020", periods=300, freq="D").to_numpy()
+    mdl = ex.fit_ridge(X, y, t_, t_, clip=5.0)
+    assert abs(mdl.predict(np.array([[1e6, 0, 0, 0, 0]]))[0]) < 10
+    ok("pairs together: cross-pair channels, dollar factor, three runs merged, tables, clipped Ridge")
+
+
 def test_anomaly(tmp: Path, h: pd.DataFrame, cfg: ex.ExperimentConfig):
     acfg = L.anomaly_config(start="2022-01-01", end=None, min_train_rows=60, n_bootstrap=20, stage_b_top_k=1,
                             data_dir=str(tmp / "data"), output_dir=str(tmp / "anomaly"))
@@ -186,5 +242,6 @@ if __name__ == "__main__":
         test_channels(h)
         cfg = test_vol_and_direction(tmp, h)
         test_pairs(tmp, cfg)
+        test_cross(tmp, h, cfg)
         test_anomaly(tmp, h, cfg)
     print("\nALL FX SMOKE CHECKS PASSED")

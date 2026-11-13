@@ -97,6 +97,21 @@ PAIR_TESTS = [("Ridge | intraday signature", [
     "HAR-RV-L", "HAR-RV-L calibrated", "Ridge | intraday lag bank (matched)", "Ridge | intraday multiscale stats"])]
 PAIR_DIRECTION_MODELS = ("Logit | HAR", "Logit | HAR + intraday signature", "HAR-RV-L", "Ridge | intraday signature")
 
+# Pairs together ("interaction"): each pair's hourly path also carries the other pairs' prices, so
+# the signature's cross terms can pick up how the pairs move together and which one leads. Three
+# runs per pair on identical rows, all with clipped Ridge features (RIDGE_CLIP):
+#   own   - this pair only, original channels (price, activity, range): the reference
+#   usd   - plus the dollar factor (the average move of the dollar against the four pairs)
+#   pairs - plus the other three pairs' log prices (the interaction model)
+OWN_DIMS = ("price", "activity", "range")
+RIDGE_CLIP = 5.0  # standardized features clipped to +-5 SD of the training rows
+CROSS_VARIANTS = ("own", "usd", "pairs")
+CROSS_LABELS = {"own": "own pair", "usd": "+ dollar factor", "pairs": "+ other pairs"}
+CROSS_BASELINES = ("Mean", "HAR-RV-L", "HAR-RV-L calibrated", "HAR-RV-L (intraday RV)",
+                   "Ridge | intraday multiscale stats")
+CROSS_PATH_MODELS = ("Ridge | intraday signature", "Ridge | intraday lag bank (matched)",
+                     "Ridge | intraday signature + HAR-RV")
+
 # Anomaly study grid: channels are the only axis; the rest is fixed in advance
 ANOMALY_CHANNELS = ("price", "price+volume+range+flow", "price_sa", "price_sa+spread",
                     "price_sa+volume+range_sa+spread")
@@ -127,6 +142,26 @@ def pair_vol_config(symbol: str, quick: bool = False, **changes) -> ex.Experimen
         return vol_config(quick, **changes)
     changes = {"output_dir": str(RESULTS / "pairs" / symbol / ("vol_quick" if quick else "vol")), **changes}
     return vol_config(quick, fx_symbol=symbol, **changes)
+
+
+def cross_dims(symbol: str, variant: str) -> tuple:
+    others = tuple(p for p in PAIRS if p != symbol)
+    return {"own": OWN_DIMS, "usd": OWN_DIMS + ("usd",), "pairs": OWN_DIMS + tuple(f"x:{p}" for p in others)}[variant]
+
+
+def cross_config(symbol: str, variant: str, quick: bool = False, **changes) -> ex.ExperimentConfig:
+    """One run of the pairs-together experiment: ``symbol``'s volatility, with the hourly path of
+    ``cross_dims(symbol, variant)``. The baselines are fit in the ``own`` run only."""
+    dims = cross_dims(symbol, variant)
+    models = (CROSS_BASELINES if variant == "own" else ()) + CROSS_PATH_MODELS
+    changes = {
+        "fx_symbol": symbol, "cross_pairs": tuple(p for p in PAIRS if p != symbol) if variant != "own" else (),
+        "ridge_clip": RIDGE_CLIP, "models": models, "run_ablations": False, "intraday_ablation_dims": {},
+        "spec_overrides": {h: {"intraday_dims": dims} for h in HORIZONS},
+        "output_dir": str(RESULTS / "cross" / symbol / (variant + ("_quick" if quick else ""))),
+        **changes,
+    }
+    return vol_config(quick, **changes)
 
 
 def anomaly_config(quick: bool = False, **changes) -> AnomalyConfig:
@@ -336,6 +371,106 @@ def plot_pairs(level: pd.DataFrame, cols=("Signature", "Signature, original chan
     fig.suptitle("Does the hourly path help beyond HAR, pair by pair?")
     fig.tight_layout()
     return fig
+
+
+# ---------------------------------------------------------------- pairs together (interaction)
+
+
+def run_cross(pairs=PAIRS, quick: bool = False, subprocess_per_horizon: bool = True, **changes) -> dict:
+    """Run the three variants for each pair (own / + dollar factor / + other pairs). Every pair's
+    data must be downloaded (section 9 does that). Finished runs are skipped. Returns
+    {pair: {variant: config}}."""
+    cfgs = {}
+    for sym in pairs:
+        cfgs[sym] = {}
+        for v in CROSS_VARIANTS:
+            cfg = cross_config(sym, v, quick, **changes)
+            LOGGER.info("==== %s | %s ====", sym, CROSS_LABELS[v])
+            ex.run_all(cfg, subprocess_per_horizon=subprocess_per_horizon)
+            cfgs[sym][v] = cfg
+    return cfgs
+
+
+_CROSS_SHORT = {"Ridge | intraday signature": "Signature", "Ridge | intraday lag bank (matched)": "Lag bank",
+                "Ridge | intraday signature + HAR-RV": "Signature + HAR-RV"}
+
+
+def load_cross(cfgs: dict) -> dict:
+    """{pair: Results} with the three variants merged on identical rows. Path models are renamed
+    "Signature | own pair", "Signature | + other pairs", ...; the baselines come from the own run."""
+    out = {}
+    for sym, by_variant in cfgs.items():
+        try:
+            parts = {v: rp.load_results(c.output_dir) for v, c in by_variant.items()}
+        except FileNotFoundError as exc:
+            LOGGER.warning("%s: not finished (%s)", sym, exc)
+            continue
+        metrics, preds = [], []
+        times = None
+        for v, r in parts.items():
+            m, p = r.metrics.copy(), r.predictions.copy()
+            for df in (m, p):
+                path = df.Model.isin(_CROSS_SHORT)
+                df.loc[path, "Model"] = df.loc[path, "Model"].map(_CROSS_SHORT) + " | " + CROSS_LABELS[v]
+            t = p.groupby("Horizon").Time.apply(lambda x: tuple(sorted(x.unique())))
+            if times is not None and not t.equals(times):
+                raise RuntimeError(f"{sym}: the {v} run has different rows from the own run")
+            times = t
+            metrics.append(m)
+            preds.append(p)
+        own = parts["own"]
+        out[sym] = rp.Results(pd.concat(metrics, ignore_index=True), pd.concat(preds, ignore_index=True),
+                              pd.DataFrame(), own.meta)
+    return out
+
+
+def cross_level_table(results: dict) -> pd.DataFrame:
+    """Fold-mean RMSE % better than HAR-RV-L, per pair and horizon, for the signature on each path
+    and the HAR benchmarks."""
+    cols = {f"Signature | {CROSS_LABELS[v]}": f"Signature | {CROSS_LABELS[v]}" for v in CROSS_VARIANTS}
+    cols.update({f"Lag bank | {CROSS_LABELS['pairs']}": f"Lag bank | {CROSS_LABELS['pairs']}",
+                 "HAR on hourly RV": "HAR-RV-L (intraday RV)", "HAR calibrated": "HAR-RV-L calibrated"})
+    rows = []
+    for sym, res in results.items():
+        s = rp.summary_table(res)
+        s["Horizon"] = s.Horizon.astype(str)
+        pct = s.set_index(["Horizon", "Model"]).Pct_vs_HAR
+        for h in s.Horizon.unique():
+            rows.append({"Pair": sym, "Horizon": h, **{c: pct.get((h, m), np.nan) for c, m in cols.items()}})
+    return pd.DataFrame(rows)
+
+
+def cross_test_table(results: dict) -> pd.DataFrame:
+    """Does adding the other pairs help? The signature with the other pairs against the same
+    signature on the own pair, the dollar-factor path, the lag bank with the other pairs, HAR and
+    calibrated HAR: pooled RMSE % better (> 0 = the other-pairs signature is better) and the DM p."""
+    model = f"Signature | {CROSS_LABELS['pairs']}"
+    tests = [(model, [f"Signature | {CROSS_LABELS['own']}", f"Signature | {CROSS_LABELS['usd']}",
+                      f"Lag bank | {CROSS_LABELS['pairs']}", "HAR-RV-L", "HAR-RV-L calibrated"])]
+    frames = []
+    for sym, res in results.items():
+        t = rp.pair_table(res, tests)
+        if len(t):
+            frames.append(t.assign(Pair=sym, Horizon=t.Horizon.astype(str)))
+    t = pd.concat(frames, ignore_index=True)
+    wide = t.pivot_table(index=["Horizon", "Pair"], columns="Versus", values=["Pct_better", "DM_p"], sort=False)
+    return wide.swaplevel(0, 1, axis=1).sort_index(axis=1, level=0, sort_remaining=False)
+
+
+def plot_cross(level: pd.DataFrame):
+    return plot_pairs(level, cols=[f"Signature | {CROSS_LABELS[v]}" for v in CROSS_VARIANTS] + ["HAR calibrated"])
+
+
+def worst_errors(res: rp.Results, model: str = "Ridge | intraday signature", n: int = 8) -> pd.DataFrame:
+    """The test days with the largest absolute errors of ``model``, with HAR's error on the same day:
+    shows whether a bad RMSE comes from a few extreme days."""
+    p = res.predictions
+    w = p.pivot_table(index=["Horizon", "Time"], columns="Model", values="Prediction")
+    a = p.drop_duplicates(["Horizon", "Time"]).set_index(["Horizon", "Time"]).Actual.reindex(w.index)
+    out = pd.DataFrame({"Actual": a, model: w[model], "HAR-RV-L": w["HAR-RV-L"]})
+    out["Error"] = out[model] - out.Actual
+    out["HAR error"] = out["HAR-RV-L"] - out.Actual
+    return out.reindex(out.Error.abs().sort_values(ascending=False).index).groupby(level=0, observed=True).head(n)
 
 
 # ---------------------------------------------------------------- volatility direction

@@ -540,6 +540,12 @@ def time_augment(path: np.ndarray) -> np.ndarray:
     return np.column_stack([t, path])
 
 
+def _from_start(x: pd.Series) -> np.ndarray:
+    """A level series relative to its first value; gaps are carried forward (back at the start)."""
+    v = x.ffill().bfill().to_numpy(float)
+    return np.zeros(len(v)) if np.isnan(v).all() else v - v[0]
+
+
 def make_base_path(window: pd.DataFrame, dims: Iterable[str]) -> np.ndarray:
     dims = tuple(dims)
     coordinates: list[np.ndarray] = []
@@ -574,6 +580,19 @@ def make_base_path(window: pd.DataFrame, dims: Iterable[str]) -> np.ndarray:
     if "spread" in dims:  # running mean of the abnormal log spread: rises while spreads are unusually wide
         sp = window["spread_sa"].to_numpy(float)
         coordinates.append(np.cumsum(sp) / len(sp))
+
+    # Other FX pairs over the same hours (fx_cross_channels): "x:GBPUSD" is GBP/USD's log price from
+    # the window start; "usd" is the dollar factor (average log move of the dollar against the pairs).
+    for d in dims:
+        if d.startswith("x:"):
+            col = f"lclose__{d[2:]}"
+            if col not in window.columns:
+                raise ValueError(f"'{d}' needs a {col} column (set cross_pairs; see fx_cross_channels).")
+            coordinates.append(_from_start(window[col]))
+    if "usd" in dims:
+        if "usd_log" not in window.columns:
+            raise ValueError("'usd' needs a usd_log column (set cross_pairs; see fx_cross_channels).")
+        coordinates.append(_from_start(window["usd_log"]))
 
     if "stress" in dims:
         if "stress_prob" not in window.columns:
@@ -1561,6 +1580,34 @@ def fx_hourly_channels(hourly: pd.DataFrame, weeks: int = 52, min_weeks: int = 8
     if "spread" in h.columns:
         ls = np.log(h["spread"].clip(lower=1e-7))
         h["spread_sa"] = (ls - past_slot_mean(ls)).fillna(0.0).clip(-3.0, 3.0)
+    return h
+
+
+def usd_side(symbol: str) -> int:
+    """+1 if the dollar is the base currency (USDJPY: a rise = a stronger dollar), -1 if it is the
+    quote (EURUSD: a rise = a weaker dollar), 0 if the pair has no dollar."""
+    s = symbol.upper()
+    return 1 if s[:3] == "USD" else -1 if s[3:6] == "USD" else 0
+
+
+def fx_cross_channels(hourly: pd.DataFrame, symbol: str, others: dict, max_gap_hours: int = 3) -> pd.DataFrame:
+    """Add other pairs' prices over the same hours, for paths with several pairs.
+
+    * ``lclose__<PAIR>``: the other pair's log close at each of this pair's hourly bars. A missing
+      hour takes the last earlier close (at most ``max_gap_hours`` back), so nothing uses later data.
+    * ``usd_log``: the dollar factor, the cumulative mean of the hourly log moves of the dollar
+      against every pair available that hour (this one included), signed so that up = stronger dollar.
+    """
+    h = hourly.copy()
+    moves = {symbol: np.log(h["close"]).diff()}
+    for sym, bars in others.items():
+        lc = np.log(bars["close"]).sort_index()
+        lc = lc[~lc.index.duplicated(keep="last")].reindex(h.index).ffill(limit=max_gap_hours)
+        h[f"lclose__{sym}"] = lc
+        moves[sym] = lc.diff()
+    signed = [usd_side(s) * m for s, m in moves.items() if usd_side(s)]
+    if signed:
+        h["usd_log"] = pd.concat(signed, axis=1).mean(axis=1).fillna(0.0).cumsum()
     return h
 
 

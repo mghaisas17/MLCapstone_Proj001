@@ -50,6 +50,7 @@ from forecast_data import (
     fetch_dukascopy_hourly,
     future_drawdown_targets,
     fx_daily_from_hourly,
+    fx_cross_channels,
     fx_hourly_channels,
     load_or_download_yahoo,
 )
@@ -108,6 +109,12 @@ class ExperimentConfig:
     asset: str = "crypto"
     fx_symbol: str = "EURUSD"
     fx_start: str = "2012-01-01"
+    # FX: other pairs whose hourly prices are joined to fx_symbol's bars (fx_cross_channels), for
+    # the "x:<PAIR>" and "usd" path dims. Empty = this pair only.
+    cross_pairs: tuple = ()
+    # Clip standardized features to +-ridge_clip in the Ridge models (None = no clipping), so a few
+    # extreme windows (a flash crash) cannot produce extreme forecasts.
+    ridge_clip: float | None = None
     # FX only: also load the bid-ask spread and add the time-of-day-adjusted channels
     # (forecast_data.fx_hourly_channels), which the path dims price_sa / range_sa / spread need.
     fx_channels: bool = False
@@ -206,7 +213,7 @@ class ExperimentConfig:
     @classmethod
     def from_json(cls, path: str | Path) -> "ExperimentConfig":
         d = json.loads(Path(path).read_text())
-        for k in ("horizons", "models", "ablation_models", "flag_features"):
+        for k in ("horizons", "models", "ablation_models", "flag_features", "cross_pairs"):
             if d.get(k) is not None:
                 d[k] = tuple(d[k])
         return cls(**d)
@@ -258,11 +265,21 @@ def purged_walk_forward(
     return folds
 
 
-def fit_ridge(X, y, times, target_end, alphas=None, inner_splits: int = 5) -> Pipeline:
+def _clip_features(X, c):
+    return np.clip(X, -c, c)
+
+
+def fit_ridge(X, y, times, target_end, alphas=None, inner_splits: int = 5, clip: float | None = None) -> Pipeline:
     """Ridge with alpha chosen by an inner purged walk-forward CV on the
-    training rows only (the inner CV has the same label overlap as the outer)."""
+    training rows only (the inner CV has the same label overlap as the outer).
+    With ``clip``, standardized features are clipped to +-clip (training mean and SD)."""
+    from sklearn.preprocessing import FunctionTransformer
+
     alphas = np.logspace(-4, 4, 9) if alphas is None else alphas
-    pipe = Pipeline([("scale", StandardScaler()), ("ridge", Ridge())])
+    steps = [("scale", StandardScaler())]
+    if clip:
+        steps.append(("clip", FunctionTransformer(_clip_features, kw_args={"c": float(clip)})))
+    pipe = Pipeline(steps + [("ridge", Ridge())])
     inner = purged_walk_forward(times, target_end, inner_splits, min_train_rows=10, strict=False)
     if not inner:
         return pipe.set_params(ridge__alpha=1.0).fit(X, y)
@@ -425,7 +442,7 @@ def _ridge(kind):
     def run(c):
         Xtr, Xte = c.xy(kind)
         tr = c.fold.train
-        model = fit_ridge(Xtr, c.y_train, c.ds.times[tr], c.ds.target_end[tr])
+        model = fit_ridge(Xtr, c.y_train, c.ds.times[tr], c.ds.target_end[tr], clip=c.cfg.ridge_clip)
         return model.predict(Xte)
 
     return run
@@ -827,14 +844,18 @@ def load_intraday(cfg: ExperimentConfig) -> pd.DataFrame:
     Dukascopy for FX (where they are also the source of the daily bars)."""
     end = cfg.intraday_end or cfg.yahoo_end or str(pd.Timestamp.now(tz="UTC").date())
     if cfg.asset == "fx":
-        key = ("fx", cfg.fx_symbol, cfg.fx_start, end, cfg.fx_channels)
+        key = ("fx", cfg.fx_symbol, cfg.fx_start, end, cfg.fx_channels, tuple(cfg.cross_pairs))
         if key not in _INTRADAY_MEMO:
             _INTRADAY_MEMO.clear()
-            bars = fetch_dukascopy_hourly(
-                cfg.fx_start, end, symbol=cfg.fx_symbol, data_dir=Path(cfg.data_dir) / "dukascopy",
+            fetch = lambda sym: fetch_dukascopy_hourly(
+                cfg.fx_start, end, symbol=sym, data_dir=Path(cfg.data_dir) / "dukascopy",
                 force_download=cfg.force_download, spread=cfg.fx_channels,
             )
-            _INTRADAY_MEMO[key] = fx_hourly_channels(bars) if cfg.fx_channels else bars
+            bars = fetch(cfg.fx_symbol)
+            bars = fx_hourly_channels(bars) if cfg.fx_channels else bars
+            if cfg.cross_pairs:
+                bars = fx_cross_channels(bars, cfg.fx_symbol, {s: fetch(s) for s in cfg.cross_pairs})
+            _INTRADAY_MEMO[key] = bars
         return _INTRADAY_MEMO[key]
     key = (cfg.symbol, cfg.intraday_start, end)
     if key not in _INTRADAY_MEMO:
