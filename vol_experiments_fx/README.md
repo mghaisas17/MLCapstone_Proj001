@@ -55,8 +55,21 @@ Across the four pairs (section 9):
   signature is the better summary of the path wherever the run is stable.
 - **HAR on hourly RV ties HAR on every pair** (−1.2% to +0.2%): the hourly path adds little at 1 and 5 days
   across FX, not only on EUR/USD.
-- **GBP/USD is an outlier** (signature −36% / −51% vs HAR, the lag bank also bad, HAR-type models fine),
-  most likely a few extreme days such as the 2016 flash crash. Check `L.worst_errors` in section 9
-  before quoting GBP/USD; section 10 clips the Ridge features to guard against it.
+- **GBP/USD was broken by the Brexit vote, now fixed.** Unclipped, the signature was −36% / −51% vs HAR.
+  `L.worst_errors` shows why: for weeks after 23 June 2016 the 22-day window contains the shock and the
+  5-day forecast is 0.09–0.11 against 0.02 realized. Clipping standardized Ridge inputs at ±5 SD
+  (section 10) brings GBP/USD to −1.0% / −1.3%, in line with the other pairs, and helps elsewhere too
+  (AUD/USD 5 days −11.2% → −3.1%). Use clipping in any future run.
+
+Pairs together (section 10, all with clipped inputs), % better than HAR:
+
+- **Adding the other pairs' prices makes every pair worse**: −1.1% to −7.6% against the own-pair
+  signature, significant on 5 of 8 pair-horizons. The dollar factor alone also hurts. Likely reason: the
+  other pairs mostly carry the dollar move the own price already shows, and the features grow from about
+  400 to about 2,400 on 3,300 training days.
+- **The signature still beats the lag bank with the same multi-pair data** (+0.7% to +4.5%, significant at
+  1 day on GBP/USD, USD/JPY, AUD/USD). The "better summary of the path" result holds in every setting.
+- **Best signature result anywhere in FX**: EUR/USD own pair, 1 day, +1.8% vs HAR, still below HAR with its
+  bias removed (+2.5%). No FX configuration beats calibrated HAR.
 
 The sponsor report is `fx_signature_report.html`.

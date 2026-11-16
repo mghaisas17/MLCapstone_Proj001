@@ -97,7 +97,8 @@ details summary:focus-visible { outline: 2px solid var(--accent); outline-offset
     <p>On EUR/USD the signature is again a much better summary of the hourly path than the raw path itself, but it does
     not beat a HAR forecast. The reason looks like the data, not the method. On EUR/USD, HAR fed with hourly
     realized variance doesn't beat plain daily HAR either. So at 1 and 5 days the hourly path holds little that the
-    daily volatility history doesn't already contain.</p>
+    daily volatility history doesn't already contain. The same holds on GBP/USD, USD/JPY and AUD/USD, and giving each
+    pair's path the other pairs' prices does not change it.</p>
   </div>
 </header>
 
@@ -106,7 +107,7 @@ details summary:focus-visible { outline: 2px solid var(--accent); outline-offset
     <div class="verdict">
       <span class="chip bad">Does not beat HAR</span>
       <h3>Volatility level</h3>
-      <p>Signature forecasts are 1.2% (1 day) and 4.6% (5 days) worse than HAR. On Bitcoin they were 5–15% better.</p>
+      <p>Signature forecasts are 1.2% (1 day) and 4.6% (5 days) worse than HAR on EUR/USD, and no better on three more pairs. On Bitcoin they were 5–15% better.</p>
     </div>
     <div class="verdict">
       <span class="chip neu">No added information</span>
@@ -235,6 +236,36 @@ details summary:focus-visible { outline: 2px solid var(--accent); outline-offset
 </section>
 
 <section>
+  <div class="eyebrow">Finding 6 · Four pairs, and pairs together</div>
+  <h2>The result holds on four pairs, and adding the other pairs to the path makes it worse</h2>
+  <p>We repeated the volatility forecasts on GBP/USD, USD/JPY and AUD/USD. Then we gave each pair's signature the
+  other three pairs' hourly prices, so its cross terms could pick up how the pairs move together and which one moves
+  first. A second variant added only a dollar factor, the dollar's average move against all four pairs.</p>
+  <div class="figure">
+    <div class="tbl"><table>
+      <thead><tr><th>Pair · horizon</th><th class="num">Own pair</th><th class="num">+ dollar factor</th><th class="num">+ other pairs</th><th class="num">HAR on hourly RV</th><th class="num">HAR, bias removed</th></tr></thead>
+      <tbody>
+        <tr><td>EUR/USD · 1 day</td><td class="num">+1.8%</td><td class="num">+0.5%</td><td class="num">−1.7%</td><td class="num">−0.4%</td><td class="num">+2.5%</td></tr>
+        <tr><td>GBP/USD · 1 day</td><td class="num">−1.0%</td><td class="num">−1.2%</td><td class="num">−2.1%</td><td class="num">+0.2%</td><td class="num">+1.7%</td></tr>
+        <tr><td>USD/JPY · 1 day</td><td class="num">−0.1%</td><td class="num">−2.0%</td><td class="num">−2.8%</td><td class="num">+0.2%</td><td class="num">+2.5%</td></tr>
+        <tr><td>AUD/USD · 1 day</td><td class="num">−0.8%</td><td class="num">−2.9%</td><td class="num">−4.2%</td><td class="num">−1.2%</td><td class="num">+1.4%</td></tr>
+        <tr><td>EUR/USD · 5 days</td><td class="num">−0.6%</td><td class="num">−4.1%</td><td class="num">−8.1%</td><td class="num">−1.4%</td><td class="num">+1.6%</td></tr>
+        <tr><td>GBP/USD · 5 days</td><td class="num">−1.3%</td><td class="num">−2.8%</td><td class="num">−6.2%</td><td class="num">+0.0%</td><td class="num">+1.2%</td></tr>
+        <tr><td>USD/JPY · 5 days</td><td class="num">−1.2%</td><td class="num">−4.4%</td><td class="num">−7.8%</td><td class="num">−0.1%</td><td class="num">+1.7%</td></tr>
+        <tr><td>AUD/USD · 5 days</td><td class="num">−3.1%</td><td class="num">−4.8%</td><td class="num">−8.5%</td><td class="num">−2.1%</td><td class="num">+0.7%</td></tr>
+      </tbody>
+    </table></div>
+    <p class="cap">% RMSE improvement over daily HAR, mean of 3 walk-forward folds; above zero is better. The first three columns are the signature model with each path. Signature inputs capped at 5 standard deviations (see below).</p>
+  </div>
+  <ul>
+    <li><strong>No pair beats HAR with its bias removed</strong>, in any variant. HAR fed hourly volatility ties plain HAR on every pair (−2.1% to +0.2%), so the hourly path holds little extra information across FX, not just on EUR/USD.</li>
+    <li><strong>The other pairs make every forecast worse</strong>: 1.1–7.6% worse than the own-pair signature, significantly so on 5 of the 8 pair-horizons. The dollar factor alone also hurts. Most of what the other pairs carry is the dollar move, and the pair's own price already reflects it. The extra features (about 2,400 instead of about 400) mostly add noise.</li>
+    <li><strong>The signature still beats raw lags</strong> with the same multi-pair data: +0.7% to +4.5%, significant at 1 day on GBP/USD, USD/JPY and AUD/USD. That makes four settings where this holds.</li>
+    <li><strong>One robustness lesson.</strong> Without the cap, GBP/USD forecasts were 36–51% worse than HAR. For weeks after the June 2016 Brexit vote, the signature saw the shock in its 22-day window and forecast 5-day volatility four to six times too high (0.09–0.11 against 0.02 realized). Capping standardized inputs at 5 standard deviations brings GBP/USD back in line with the other pairs (−1.0% and −1.3%), and it helps or is neutral elsewhere (AUD/USD at 5 days goes from −11.2% to −3.1%).</li>
+  </ul>
+</section>
+
+<section>
   <div class="eyebrow">Next</div>
   <h2>What we would try next</h2>
   <div class="cols">
@@ -243,8 +274,8 @@ details summary:focus-visible { outline: 2px solid var(--accent); outline-offset
       <ul>
         <li><strong>Longer horizons.</strong> On Bitcoin the gain grew with the horizon (+4.6% at 1 day, +15.4% at 30 days).
         This EUR/USD run stopped at 5 days; a 22-day run is the most direct next test.</li>
-        <li><strong>More pairs, pooled.</strong> One pair gives about 3,300 training days for ~800 signature features. Pooling
-        GBP/USD, USD/JPY and AUD/USD multiplies the data and tests the spread lead above.</li>
+        <li><strong>Pooling pairs.</strong> Each pair gives about 3,300 training days. Training one model on all four pairs
+        multiplies the data, which the extra features in Finding 6 suggest is the binding limit.</li>
         <li><strong>Event information.</strong> FX volatility is driven by scheduled releases (payrolls, central-bank
         meetings) that no price path anticipates. A release calendar is the obvious missing input.</li>
       </ul>
@@ -253,7 +284,8 @@ details summary:focus-visible { outline: 2px solid var(--accent); outline-offset
       <h3 style="margin-bottom:8px">What we would drop</h3>
       <ul>
         <li>Neural networks on signatures: far worse than ridge on both assets.</li>
-        <li>Time-of-day adjustment for the forecasting path: keep the original channels.</li>
+        <li>Time-of-day adjustment for the forecasting path: no consistent gain across pairs.</li>
+        <li>Other pairs' prices or a dollar factor in the path: worse on every pair.</li>
         <li>Signature features in a direction classifier: they overfit; use the volatility forecast instead.</li>
       </ul>
     </div>
@@ -268,6 +300,7 @@ details summary:focus-visible { outline: 2px solid var(--accent); outline-offset
     <dt>Target</dt><dd>Realized volatility over the next 1 or 5 trading days, about 3,300 forecast days.</dd>
     <dt>Testing</dt><dd>3 expanding walk-forward folds, purged so no training target overlaps a test day. Settings fixed in advance. Diebold-Mariano tests for forecasts, block bootstrap for AUCs.</dd>
     <dt>Benchmarks</dt><dd>HAR-RV with a leverage term; HAR with its bias removed; HAR on hourly realized variance; signature-free features from the same window (matched lag bank, multiscale statistics).</dd>
+    <dt>Pairs</dt><dd>Same setup on GBP/USD, USD/JPY and AUD/USD. Pairs-together runs add the other pairs' hourly log prices (or a dollar factor) as extra path channels, with standardized ridge inputs capped at ±5 SD.</dd>
     <dt>Bitcoin</dt><dd>Same pipeline on BTC/USDT (daily rows since 2015, hourly path since 2017), from the earlier notebooks.</dd>
     <dt>Code</dt><dd><code>vol_experiments_fx/vol_fx.ipynb</code> and <code>anomaly_fx.ipynb</code></dd>
   </dl>
