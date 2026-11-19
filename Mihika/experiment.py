@@ -541,6 +541,8 @@ def _anomaly_scores(ctx, which: str) -> np.ndarray:
     choice = selection[hk]["best_signature" if which == "sig" else "best_signature_free"]
     if acfg.asset != cfg.asset:
         raise ValueError(f"anomaly_selection is from an asset={acfg.asset!r} study but this run is asset={cfg.asset!r}")
+    if cfg.asset == "fx" and acfg.symbol != cfg.fx_symbol:
+        raise ValueError(f"anomaly_selection is from a {acfg.symbol} study but this run forecasts {cfg.fx_symbol}")
     spec = AC.horizon_specs(acfg.asset)[hk]
 
     cache_key = ("anomaly_rows", which)

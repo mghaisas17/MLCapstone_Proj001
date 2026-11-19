@@ -185,13 +185,16 @@ def cross_config(symbol: str, variant: str, quick: bool = False, **changes) -> e
     return vol_config(quick, **changes)
 
 
-def anomaly_config(quick: bool = False, **changes) -> AnomalyConfig:
+def anomaly_config(quick: bool = False, symbol: str = SYMBOL, **changes) -> AnomalyConfig:
+    """The anomaly study for one pair. EUR/USD writes to results/anomaly (the main study); other
+    pairs to results/pairs/<pair>/anomaly."""
+    out = RESULTS / "anomaly" if symbol == SYMBOL else RESULTS / "pairs" / symbol / "anomaly"
     cfg = AnomalyConfig(
-        asset="fx", symbol=SYMBOL, fx_channels=True, horizons=("1d", "5d"), start=START, end=END,
+        asset="fx", symbol=symbol, fx_channels=True, horizons=("1d", "5d"), start=START, end=END,
         target_rows={"1d": None, "5d": None},
         channel_sets=ANOMALY_CHANNELS, normalizations=("trailing_vol",), window_mults=(1.0,),
         lead_lag=(True,), depths=(2, 3), stage_b_detectors=("hmm",), stage_b_top_k=3,
-        data_dir=str(DATA_DIR), output_dir=str(RESULTS / "anomaly"),
+        data_dir=str(DATA_DIR), output_dir=str(out),
     )
     if quick:
         cfg = replace(cfg, start="2021-01-01", n_bootstrap=100, output_dir=cfg.output_dir + "_quick")
@@ -524,6 +527,86 @@ def worst_errors(res: rp.Results, model: str = "Ridge | intraday signature", n: 
     out["Error"] = out[model] - out.Actual
     out["HAR error"] = out["HAR-RV-L"] - out.Actual
     return out.reindex(out.Error.abs().sort_values(ascending=False).index).groupby(level=0, observed=True).head(n)
+
+
+# ---------------------------------------------------------------- anomaly study on more pairs
+
+
+def run_anomaly_pairs(pairs=PAIRS, quick: bool = False, subprocess_per_horizon: bool = True, **changes) -> dict:
+    """The anomaly study (same grid as EUR/USD) on each pair; finished horizons are skipped, so
+    EUR/USD's study is reused. Returns {pair: AnomalyConfig}."""
+    from anomaly import run as ARUN
+
+    cfgs = {}
+    for sym in pairs:
+        cfg = anomaly_config(quick, symbol=sym, **changes)
+        LOGGER.info("==== anomaly study: %s ====", sym)
+        ARUN.run_all(cfg, subprocess_per_horizon=subprocess_per_horizon)
+        cfgs[sym] = cfg
+    return cfgs
+
+
+def load_anomaly_pairs(cfgs: dict) -> dict:
+    from anomaly import report as R
+
+    out = {}
+    for sym, cfg in cfgs.items():
+        try:
+            out[sym] = R.load_results(cfg.output_dir)
+        except FileNotFoundError as exc:
+            LOGGER.warning("%s: anomaly study not finished (%s)", sym, exc)
+    return out
+
+
+def anomaly_pairs_gate(results: dict) -> pd.DataFrame:
+    """The gate for every pair: does the best signature detector beat the best signature-free one on
+    the held-out fold?"""
+    from anomaly import report as R
+
+    return pd.concat([R.gate_table(r).assign(Pair=s) for s, r in results.items()], ignore_index=True) \
+        .set_index(["Pair", "Horizon"]).reset_index()
+
+
+def anomaly_pairs_channels(results: dict) -> pd.DataFrame:
+    """Best signature config per channel set, detector, horizon and pair; Select / Confirm AUCs."""
+    t = pd.concat([channel_table(r).assign(Pair=s) for s, r in results.items()], ignore_index=True)
+    return t.pivot_table(index=["Horizon", "Channels"], columns="Pair", values="Confirm", aggfunc="max", sort=False)
+
+
+def run_anomaly_vol_pairs(pairs=PAIRS, quick: bool = False, subprocess_per_horizon: bool = True,
+                          anomaly_cfgs: dict | None = None, **changes) -> dict:
+    """The anomaly score in each pair's volatility forecasts (vol_fx section 7, per pair): HAR plus
+    the selected detector's score as a feature and as a residual correction. Needs that pair's
+    anomaly study (``anomaly_cfgs`` from run_anomaly_pairs, else the default folders). Returns
+    {pair: ExperimentConfig} for the pairs that ran."""
+    cfgs = {}
+    for sym in pairs:
+        acfg = (anomaly_cfgs or {}).get(sym) or anomaly_config(quick, symbol=sym)
+        selection = Path(acfg.output_dir) / "best_configs.json"
+        if not selection.exists():
+            LOGGER.warning("%s: no anomaly study yet (%s); skipped", sym, selection)
+            continue
+        base = pair_vol_config(sym, quick)
+        out = Path(base.output_dir).parent / ("vol_anomaly_quick" if quick else "vol_anomaly")
+        cfg = replace(base, **{"use_anomaly": True, "anomaly_selection": str(selection), "run_ablations": False,
+                               "models": ("Mean", "HAR-RV-L", "HAR-RV-L calibrated", *ANOMALY_MODELS),
+                               "output_dir": str(out), **changes})
+        LOGGER.info("==== anomaly score in the forecasts: %s ====", sym)
+        ex.run_all(cfg, subprocess_per_horizon=subprocess_per_horizon)
+        cfgs[sym] = cfg
+    return cfgs
+
+
+def anomaly_vol_pairs_table(cfgs: dict) -> pd.DataFrame:
+    """rp.anomaly_effect_table for every pair: does HAR + the anomaly score beat HAR, and calibrated HAR?"""
+    frames = []
+    for sym, cfg in cfgs.items():
+        try:
+            frames.append(rp.anomaly_effect_table(rp.load_results(cfg.output_dir)).assign(Pair=sym))
+        except FileNotFoundError as exc:
+            LOGGER.warning("%s: not finished (%s)", sym, exc)
+    t = pd.concat(frames, ignore_index=True)
+    return t[["Pair"] + [c for c in t.columns if c != "Pair"]]
 
 
 # ---------------------------------------------------------------- volatility direction

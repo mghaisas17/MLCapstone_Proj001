@@ -241,6 +241,29 @@ def test_anomaly(tmp: Path, h: pd.DataFrame, cfg: ex.ExperimentConfig):
     plt.close(rp.plot_anomaly_response(vres))
     ok("anomaly score in the vol forecasts (feature + residual), from the new anomaly study")
 
+    # more pairs: the study per pair, the gate across pairs, the score in each pair's forecasts
+    assert L.anomaly_config(symbol="EURUSD").output_dir == L.anomaly_config().output_dir
+    assert L.anomaly_config(symbol="USDJPY").symbol == "USDJPY" and "pairs/USDJPY/anomaly" in L.anomaly_config(symbol="USDJPY").output_dir
+    acfgs = L.run_anomaly_pairs(("GBPUSD",), subprocess_per_horizon=False, start="2022-01-01", end=None,
+                                min_train_rows=60, n_bootstrap=20, stage_b_top_k=1, data_dir=str(tmp / "data"),
+                                output_dir=str(tmp / "pairs" / "GBPUSD" / "anomaly"))
+    ares2 = L.load_anomaly_pairs({"EURUSD": acfg, "GBPUSD": acfgs["GBPUSD"]})
+    g = L.anomaly_pairs_gate(ares2)
+    assert set(g.Pair) == {"EURUSD", "GBPUSD"} and len(g) == 4
+    assert set(L.anomaly_pairs_channels(ares2).columns) == {"EURUSD", "GBPUSD"}
+    keep = {k: getattr(cfg, k) for k in ("fx_start", "intraday_end", "torch_epochs", "spec_overrides", "data_dir", "cache_dir")}
+    vcfgs = L.run_anomaly_vol_pairs(("GBPUSD", "USDJPY"), subprocess_per_horizon=False, anomaly_cfgs=acfgs,
+                                    output_dir=str(tmp / "pairs" / "GBPUSD" / "vol_anomaly"), **keep)
+    assert set(vcfgs) == {"GBPUSD"}  # USD/JPY has no anomaly study here, so it is skipped
+    try:  # a detector selected on one pair must not be applied to another
+        ex.run_all(replace(vcfgs["GBPUSD"], fx_symbol="EURUSD", output_dir=str(tmp / "wrong_pair")))
+        raise AssertionError("expected a pair mismatch error")
+    except ValueError as exc:
+        assert "GBPUSD study" in str(exc)
+    t = L.anomaly_vol_pairs_table(vcfgs)
+    assert set(t.Pair) == {"GBPUSD"} and len(t)
+    ok("anomaly on more pairs: per-pair study, cross-pair gate and channels, score in each pair's forecasts")
+
 
 if __name__ == "__main__":
     h = synthetic_fx()
