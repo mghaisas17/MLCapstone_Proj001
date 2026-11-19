@@ -3,11 +3,12 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <style>
-/* Layout: one reading column (~760px) of findings; each finding = claim, chart or table, one-line reading. */
+/* Layout: one reading column (~800px); a Bitcoin-vs-FX scorecard, then findings, each = claim, chart, one-line reading. */
 :root {
   --bg: #f7f8fa; --panel: #ffffff; --ink: #141920; --ink-2: #4a5260; --ink-3: #6f7886;
   --rule: #dfe3ea; --grid: #e9ecf1; --accent: #1f5f8b;
-  --s1: #2a78d6; --s2: #eb6834;
+  /* series roles: signature = s1, HAR variants = s2 / s3, signature-free controls = ctl, multi-pair variants = s4 / s5 */
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #6250d6; --s5: #e87ba4; --ctl: #8a929e;
   --good: #1b7f4a; --good-bg: #e3f3ea; --bad: #b3362f; --bad-bg: #f8e6e4; --neu: #5d6573; --neu-bg: #eceff3;
   --f-display: "Space Grotesk", "Helvetica Neue", Arial, sans-serif;
   --f-body: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
@@ -16,13 +17,13 @@
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
   --bg: #12151a; --panel: #1a1e25; --ink: #eef0f3; --ink-2: #b9c0cb; --ink-3: #8d96a3;
   --rule: #2c323c; --grid: #262b34; --accent: #7fb6e0;
-  --s1: #3987e5; --s2: #d95926;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #9085e9; --s5: #d55181; --ctl: #7c8593;
   --good: #6fd19b; --good-bg: #173327; --bad: #f08a83; --bad-bg: #3a1f1d; --neu: #aab2be; --neu-bg: #262b33;
   color-scheme: dark; } }
 :root[data-theme="dark"] {
   --bg: #12151a; --panel: #1a1e25; --ink: #eef0f3; --ink-2: #b9c0cb; --ink-3: #8d96a3;
   --rule: #2c323c; --grid: #262b34; --accent: #7fb6e0;
-  --s1: #3987e5; --s2: #d95926;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #9085e9; --s5: #d55181; --ctl: #7c8593;
   --good: #6fd19b; --good-bg: #173327; --bad: #f08a83; --bad-bg: #3a1f1d; --neu: #aab2be; --neu-bg: #262b33;
   color-scheme: dark; }
 
@@ -42,27 +43,54 @@ header { display: flex; flex-direction: column; gap: 14px; }
 .answer { border-left: 3px solid var(--accent); padding: 4px 0 4px 18px; display: flex; flex-direction: column; gap: 8px; }
 .answer strong { font-family: var(--f-display); font-size: 1.15rem; font-weight: 600; }
 
-.verdicts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
-@media (max-width: 680px) { .verdicts { grid-template-columns: 1fr; } }
-.verdict { background: var(--panel); border: 1px solid var(--rule); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
-.verdict p { font-size: 0.92rem; color: var(--ink-2); }
 .chip { align-self: flex-start; font-family: var(--f-mono); font-size: 0.72rem; font-weight: 500; letter-spacing: 0.04em; padding: 2px 8px; border-radius: 99px; white-space: nowrap; }
 .chip.good { color: var(--good); background: var(--good-bg); }
 .chip.bad { color: var(--bad); background: var(--bad-bg); }
 .chip.neu { color: var(--neu); background: var(--neu-bg); }
 
+/* scorecard */
+.score { background: var(--panel); border: 1px solid var(--rule); border-radius: 8px; overflow-x: auto; }
+.score table { min-width: 560px; }
+.score th, .score td { padding: 12px 14px; vertical-align: middle; }
+.score td:first-child { width: 34%; font-weight: 500; }
+.score td .sub { font-weight: 400; }
+.score .cell { display: flex; flex-direction: column; gap: 4px; }
+.score .cell span:last-child { font-size: 0.82rem; color: var(--ink-2); }
+
+/* pipeline diagram */
+.pipe { background: var(--panel); border: 1px solid var(--rule); border-radius: 8px; padding: 18px; display: flex; flex-direction: column; gap: 14px; }
+.lane { display: flex; align-items: stretch; gap: 8px; flex-wrap: wrap; }
+.lane-name { width: 100%; font-family: var(--f-mono); font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-3); }
+.step { flex: 1 1 120px; min-width: 0; border: 1px solid var(--rule); border-radius: 6px; padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; font-size: 0.85rem; color: var(--ink-2); }
+.step b { font-family: var(--f-display); font-weight: 600; color: var(--ink); font-size: 0.92rem; }
+.step.sig { border-color: var(--s1); }
+.step.har { border-color: var(--s2); }
+.arrow { align-self: center; color: var(--ink-3); font-family: var(--f-mono); }
+.mini { display: block; width: 100%; height: 34px; margin-top: 4px; }
+@media (max-width: 560px) { .arrow { display: none; } .step { flex-basis: 100%; } }
+
 .figure { background: var(--panel); border: 1px solid var(--rule); border-radius: 8px; padding: 18px 18px 14px; display: flex; flex-direction: column; gap: 10px; min-width: 0; position: relative; }
 .figure .cap { font-size: 0.85rem; color: var(--ink-3); }
+.fig-title { font-family: var(--f-display); font-weight: 600; font-size: 1rem; }
 .legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 0.85rem; color: var(--ink-2); }
 .legend span { display: inline-flex; align-items: center; gap: 6px; }
 .legend i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+.legend i.dot { border-radius: 50%; }
 .panels { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
 @media (max-width: 640px) { .panels { grid-template-columns: 1fr; } }
 .panel-title { font-family: var(--f-display); font-weight: 600; font-size: 0.95rem; margin-bottom: 4px; }
 svg text { font-family: var(--f-mono); font-size: 11px; fill: var(--ink-2); }
 svg .lbl { font-family: var(--f-body); font-size: 12px; fill: var(--ink); }
+svg .grp { font-family: var(--f-mono); font-size: 10px; fill: var(--ink-3); letter-spacing: 0.06em; }
 svg .val { fill: var(--ink); font-size: 11px; }
 .tip { position: absolute; pointer-events: none; background: var(--ink); color: var(--bg); font-size: 0.8rem; padding: 6px 9px; border-radius: 6px; max-width: 260px; line-height: 1.4; z-index: 5; }
+
+/* heatmap */
+.heat table { min-width: 300px; }
+.heat td, .heat th { text-align: center; padding: 8px 6px; border-bottom: 0; }
+.heat th:first-child, .heat td:first-child { text-align: left; }
+.heat td.c { font-family: var(--f-mono); font-size: 0.82rem; border: 2px solid var(--panel); border-radius: 4px; color: var(--ink); }
+.heat td.self { background: var(--grid); color: var(--ink-3); }
 
 .tbl { overflow-x: auto; }
 table { border-collapse: collapse; width: 100%; font-size: 0.88rem; font-variant-numeric: tabular-nums; }
@@ -82,188 +110,241 @@ ul { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 
 @media (max-width: 520px) { .method dl { grid-template-columns: 1fr; } .method dd { margin-bottom: 8px; } }
 details summary { cursor: pointer; font-size: 0.85rem; color: var(--accent); }
 details summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details[open] summary { margin-bottom: 8px; }
 </style>
 
 <div class="wrap">
 
 <header>
-  <div class="eyebrow">Capstone results · EUR/USD hourly data, Jan 2012 – Oct 2026</div>
+  <div class="eyebrow">Capstone results · EUR/USD, GBP/USD, USD/JPY, AUD/USD hourly data 2012 – Oct 2026 · Bitcoin for comparison</div>
   <h1>Do path signatures carry over from Bitcoin to FX?</h1>
   <p class="lede">On Bitcoin, signatures of the hourly price path improved volatility forecasts by 5–15% over the
-  standard HAR model, and a signature anomaly detector passed our test at one day. We ran the same experiments on
-  EUR/USD, with three channels built for FX, to see whether those results carry over.</p>
+  standard HAR model, and a signature anomaly detector passed our test at one day. We ran the same experiments on four
+  major currency pairs to see whether those results carry over.</p>
   <div class="answer">
     <strong>Partly. The method carries over; the gain over HAR does not.</strong>
-    <p>On EUR/USD the signature is again a much better summary of the hourly path than the raw path itself, but it does
-    not beat a HAR forecast. The reason looks like the data, not the method. On EUR/USD, HAR fed with hourly
-    realized variance doesn't beat plain daily HAR either. So at 1 and 5 days the hourly path holds little that the
-    daily volatility history doesn't already contain. The same holds on GBP/USD, USD/JPY and AUD/USD, and giving each
-    pair's path the other pairs' prices does not change it.</p>
+    <p>On FX the signature is again a much better summary of the hourly path than the raw path itself, but it does
+    not beat a HAR forecast. The reason looks like the data, not the method: on FX, HAR fed with hourly realized
+    variance doesn't beat plain daily HAR either, while on Bitcoin it does. At 1 and 5 days the FX hourly path holds
+    little that the daily volatility history doesn't already contain. Combining pairs does not change that.</p>
   </div>
 </header>
 
-<section aria-label="Summary">
-  <div class="verdicts">
-    <div class="verdict">
-      <span class="chip bad">Does not beat HAR</span>
-      <h3>Volatility level</h3>
-      <p>Signature forecasts are 1.2% (1 day) and 4.6% (5 days) worse than HAR on EUR/USD, and no better on three more pairs. On Bitcoin they were 5–15% better.</p>
+<section aria-label="Bitcoin and FX side by side">
+  <div class="eyebrow">Scorecard</div>
+  <h2>Bitcoin and FX, side by side</h2>
+  <div class="score"><table>
+    <thead><tr><th>Question</th><th>Bitcoin</th><th>FX (4 pairs)</th></tr></thead>
+    <tbody>
+      <tr><td>Does the hourly path hold extra information?<span class="sub">HAR on hourly vs daily volatility</span></td>
+        <td><div class="cell"><span class="chip good">Yes</span><span>+5% to +7% better than HAR</span></div></td>
+        <td><div class="cell"><span class="chip bad">No</span><span>−2.1% to +0.2%</span></div></td></tr>
+      <tr><td>Does the signature model beat HAR?</td>
+        <td><div class="cell"><span class="chip good">Yes</span><span>+4.6% (1d), +10.7% (7d), +15.4% (30d)</span></div></td>
+        <td><div class="cell"><span class="chip bad">Not reliably</span><span>−3.1% to +1.8% across pairs and horizons</span></div></td></tr>
+      <tr><td>…and HAR with its bias removed?<span class="sub">the fair benchmark</span></td>
+        <td><div class="cell"><span class="chip neu">At 7 days</span><span>+10.7% vs +8.1%; not at 1 day</span></div></td>
+        <td><div class="cell"><span class="chip bad">No</span><span>on any pair or setting</span></div></td></tr>
+      <tr><td>Is the signature a better summary than raw lags?</td>
+        <td><div class="cell"><span class="chip good">Yes</span><span>+12.5% to +13.6%</span></div></td>
+        <td><div class="cell"><span class="chip good">Yes</span><span>+5.7% to +12.4%</span></div></td></tr>
+      <tr><td>Does a signature anomaly detector pass the test?</td>
+        <td><div class="cell"><span class="chip good">At 1 day</span><span>not at 1 hour or 7 days</span></div></td>
+        <td><div class="cell"><span class="chip bad">No</span><span>EUR/USD, 1 and 5 days</span></div></td></tr>
+      <tr><td>Does the signature help predict whether volatility rises?</td>
+        <td><div class="cell"><span class="chip neu">Not tested</span><span>&nbsp;</span></div></td>
+        <td><div class="cell"><span class="chip bad">No</span><span>HAR alone: AUC 0.72–0.80</span></div></td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <div class="eyebrow">Setup</div>
+  <h2>What we compare</h2>
+  <p>Every day we forecast volatility over the next 1 or 5 days (Bitcoin: 1, 7 and 30). Two families of models see
+  the same history; the question is whether the shape of the recent hourly path adds anything to HAR.</p>
+  <div class="pipe" role="img" aria-label="Signature model: last 22 days of hourly prices, turned into a path, summarized by a signature, fed to ridge regression. HAR benchmark: realized volatility over the last day, week and month, fed to a linear regression.">
+    <div class="lane">
+      <div class="lane-name">Signature model</div>
+      <div class="step sig"><b>Hourly prices</b>last 22 trading days, ~500 hours
+        <svg class="mini" viewBox="0 0 120 34" preserveAspectRatio="none" aria-hidden="true"><polyline fill="none" stroke="var(--s1)" stroke-width="1.5" points="0,22 8,20 14,24 22,17 30,19 38,12 44,15 52,10 60,16 66,13 74,20 82,18 90,25 98,21 106,14 114,16 120,11"/></svg></div>
+      <span class="arrow">→</span>
+      <div class="step sig"><b>Path</b>price, activity and range as channels, plus time and lead-lag</div>
+      <span class="arrow">→</span>
+      <div class="step sig"><b>Signature</b>depth 3: ~400 numbers that describe the path's shape and how channels move together</div>
+      <span class="arrow">→</span>
+      <div class="step sig"><b>Ridge regression</b>→ volatility forecast</div>
     </div>
-    <div class="verdict">
-      <span class="chip neu">No added information</span>
-      <h3>Volatility direction</h3>
-      <p>Will volatility rise? HAR alone gets AUC 0.79 (1 day) and 0.75 (5 days). Adding signatures doesn't raise it.</p>
+    <div class="lane">
+      <div class="lane-name">HAR benchmark</div>
+      <div class="step har"><b>Daily volatility</b>realized over the last day, week and month, plus down moves</div>
+      <span class="arrow">→</span>
+      <div class="step har"><b>Linear regression</b>→ volatility forecast; also a version with its average bias removed</div>
     </div>
-    <div class="verdict">
-      <span class="chip neu">Fails the test</span>
-      <h3>Anomaly detection</h3>
-      <p>No signature detector beats the best signature-free detector on held-out data. On Bitcoin one did, at 1 day.</p>
+    <div class="lane">
+      <div class="lane-name">Controls (same hourly window, no signature)</div>
+      <div class="step"><b>Raw lags</b>the hourly path as plain numbers, same count as the signature</div>
+      <div class="step"><b>Summary statistics</b>volatility, range, skew at several time scales</div>
+      <div class="step"><b>HAR on hourly volatility</b>does the hourly data help HAR itself?</div>
     </div>
   </div>
+  <p style="font-size:0.9rem;color:var(--ink-2)">Tested out of sample on about 2,500 days per pair (3 walk-forward folds, no overlap between training and test), with settings fixed in advance.</p>
 </section>
 
 <section>
   <div class="eyebrow">Finding 1 · Volatility level</div>
   <h2>On Bitcoin the hourly path helps. On EUR/USD it doesn't, whatever model reads it.</h2>
-  <p>Percent improvement in forecast error (RMSE) over the daily HAR model. Above zero is better than HAR. Two ways of
-  using the hourly path: a ridge regression on its signature, and HAR fed with hourly realized variance.</p>
+  <p>Percent improvement in forecast error (RMSE) over the daily HAR model; above zero is better than HAR. Three ways
+  to beat HAR: the signature of the hourly path, HAR fed with hourly volatility, and HAR with its bias removed.</p>
   <div class="figure" id="fig1">
-    <div class="legend"><span><i style="background:var(--s1)"></i>Signature of the hourly path</span><span><i style="background:var(--s2)"></i>HAR on hourly realized variance</span></div>
+    <div class="legend"><span><i style="background:var(--s1)"></i>Signature of the hourly path</span><span><i style="background:var(--s2)"></i>HAR on hourly volatility</span><span><i style="background:var(--s3)"></i>HAR, bias removed</span></div>
     <div class="panels">
       <div><div class="panel-title">Bitcoin</div><div id="c1a"></div></div>
       <div><div class="panel-title">EUR/USD</div><div id="c1b"></div></div>
     </div>
-    <p class="cap">Mean over 3 walk-forward test folds. Bitcoin horizons are 1, 7 and 30 days; EUR/USD runs 1 and 5
-    trading days. On EUR/USD, neither model differs significantly from HAR (Diebold-Mariano p = 0.36 and 0.06 for the
-    signature, 0.54 and 0.19 for hourly HAR).</p>
+    <p class="cap">Mean over 3 walk-forward test folds. Bitcoin horizons 1, 7 and 30 days (bias-removed HAR not run at 30 days); EUR/USD 1 and 5 trading days. On EUR/USD neither path model differs significantly from HAR.</p>
+  </div>
+  <div class="figure" id="fig1b">
+    <div class="fig-title">The test that explains it: does the hourly data help HAR itself?</div>
+    <div id="c1c"></div>
+    <p class="cap">HAR fed with hourly realized volatility, % better than HAR on daily volatility. On Bitcoin the hourly path carries real information; on all four FX pairs it carries almost none, which caps what any path model can do.</p>
   </div>
   <p>The one EUR/USD model that does beat HAR at 1 day (simple multiscale statistics, +2.8%) is no better than
-  HAR with its average bias removed (+2.5%, p = 0.65). What it improves is the forecast's average level, not its timing.</p>
+  HAR with its bias removed (+2.5%, p = 0.65). What it improves is the forecast's average level, not its timing.</p>
 </section>
 
 <section>
   <div class="eyebrow">Finding 2 · What does carry over</div>
   <h2>The signature is still the best way to compress the path</h2>
-  <p>Each row compares the signature model with one alternative on identical test days. The positive number shows the
-  signature's error is lower; color marks a significant difference (Diebold-Mariano p &lt; 0.05).</p>
-  <div class="figure">
+  <p>Signature model against a model fed the same hourly path as raw numbers, with the same number of inputs. Above
+  zero means the signature's error is lower.</p>
+  <div class="figure" id="fig2">
+    <div class="fig-title">Signature vs raw lags: % lower forecast error, Bitcoin and FX</div>
+    <div id="c2"></div>
+    <p class="cap">Pooled test RMSE on identical days. All significant (Diebold-Mariano p &lt; 0.01) except AUD/USD at 5 days (p = 0.05). GBP/USD is left out: before the fix in Finding 6 its runs were dominated by the Brexit vote.</p>
+  </div>
+  <details>
+    <summary>Signature against the other benchmarks (table)</summary>
     <div class="tbl"><table>
-      <thead><tr><th>Signature versus</th><th class="num">BTC 1d</th><th class="num">BTC 7d</th><th class="num">FX 1d</th><th class="num">FX 5d</th></tr></thead>
+      <thead><tr><th>Signature versus</th><th class="num">BTC 1d</th><th class="num">BTC 7d</th><th class="num">EUR 1d</th><th class="num">EUR 5d</th></tr></thead>
       <tbody>
-        <tr><td>Raw hourly path<span class="sub">lag bank with the same number of features</span></td><td class="num pos">+12.5%</td><td class="num pos">+13.6%</td><td class="num pos">+5.7%</td><td class="num pos">+10.4%</td></tr>
-        <tr><td>Summary statistics of the path<span class="sub">realized variance, range, skew etc. at several scales</span></td><td class="num ns">+1.3%</td><td class="num ns">+2.3%</td><td class="num neg">−3.9%</td><td class="num ns">−3.0%</td></tr>
-        <tr><td>HAR on hourly realized variance</td><td class="num ns">−0.5%</td><td class="num ns">+3.4%</td><td class="num ns">−0.6%</td><td class="num ns">−3.0%</td></tr>
+        <tr><td>Raw hourly path</td><td class="num pos">+12.5%</td><td class="num pos">+13.6%</td><td class="num pos">+5.7%</td><td class="num pos">+10.4%</td></tr>
+        <tr><td>Summary statistics of the path</td><td class="num ns">+1.3%</td><td class="num ns">+2.3%</td><td class="num neg">−3.9%</td><td class="num ns">−3.0%</td></tr>
+        <tr><td>HAR on hourly volatility</td><td class="num ns">−0.5%</td><td class="num ns">+3.4%</td><td class="num ns">−0.6%</td><td class="num ns">−3.0%</td></tr>
         <tr><td>HAR with bias removed</td><td class="num">–</td><td class="num">–</td><td class="num neg">−3.5%</td><td class="num neg">−6.0%</td></tr>
       </tbody>
     </table></div>
-    <p class="cap"><span class="pos">Green</span>: signature significantly better. <span class="neg">Red</span>: significantly worse. Grey: no significant difference. Pooled test RMSE. A dash means the comparison was not run.</p>
-  </div>
-  <p>The first row is the part that transfers. On both assets, the same information fed in as raw lags does 6–14%
-  worse, so the signature's way of summarizing a path helps on both. What changes on FX is that the path itself
-  carries little forecasting information. A neural network on the signature did much worse than ridge on both assets
-  (−59% and −42% versus HAR on EUR/USD), so it is not a way out.</p>
+    <p class="cap" style="font-size:0.85rem;color:var(--ink-3)"><span class="pos">Green</span> significantly better, <span class="neg">red</span> significantly worse, grey no significant difference.</p>
+  </details>
+  <p>On both assets the same information fed in as raw lags does 6–14% worse, so the signature's way of summarizing
+  a path helps on both. What changes on FX is that the path itself carries little forecasting information. A neural
+  network on the signature did much worse than ridge on both assets (−59% and −42% versus HAR on EUR/USD).</p>
 </section>
 
 <section>
   <div class="eyebrow">Finding 3 · FX-specific channels</div>
-  <h2>The new FX channels made the forecasts slightly worse</h2>
-  <p>We added two things to the path that FX traders would expect to matter: returns adjusted for the time of day (EUR/USD
-  is far more volatile at the London and New York opens than in the Asian afternoon) and the bid-ask spread relative
-  to its usual level for that hour. Same signature model and test days; only the channels change.</p>
+  <h2>The new FX channels made EUR/USD forecasts slightly worse</h2>
+  <p>We added two things FX traders would expect to matter: returns adjusted for the time of day (EUR/USD is far more
+  volatile at the London and New York opens than in the Asian afternoon) and the bid-ask spread relative to its usual
+  level for that hour. Same signature model and test days; only the channels change.</p>
   <div class="figure" id="fig3">
     <div class="panels">
       <div><div class="panel-title">1 day</div><div id="c3a"></div></div>
       <div><div class="panel-title">5 days</div><div id="c3b"></div></div>
     </div>
-    <p class="cap">% RMSE improvement over HAR, ridge on the hourly signature. Descriptive comparison: these settings were fixed in advance, not tuned.</p>
+    <p class="cap">EUR/USD, % RMSE improvement over HAR, ridge on the hourly signature. Settings fixed in advance, not tuned.</p>
   </div>
-  <p>The original channels (price, activity, range) work best, and on these they nearly tie with HAR at 1 day (+1.7%).
-  The time-of-day adjustment costs about 1.5% and the spread a little more. The adjustment probably removes a
-  pattern that HAR can't see and the signature could. Adjusted price alone, without activity and range, does much worse.
-  Depth 2 signatures did as well as depth 3, and the lead-lag transform added nothing over the plain path.</p>
+  <p>The original channels (price, activity, range) work best on EUR/USD and nearly tie with HAR at 1 day (+1.7%).
+  Across the four pairs the picture is mixed (AUD/USD did better with the adjustment at 5 days), so there is no
+  consistent gain. Depth 2 signatures did as well as depth 3, and the lead-lag transform added nothing.</p>
 </section>
 
 <section>
   <div class="eyebrow">Finding 4 · Volatility direction</div>
   <h2>Whether volatility will rise is predictable, but HAR already captures it</h2>
   <p>Target: is volatility over the next 1 or 5 days above the last 1 or 5 days? About half the days are “up”. AUC on
-  the same 2,490 test days; 0.5 is a coin flip.</p>
-  <div class="figure">
-    <div class="tbl"><table>
-      <thead><tr><th>Model</th><th class="num">1 day</th><th class="num">5 days</th></tr></thead>
-      <tbody>
-        <tr><td>Logistic on HAR features<span class="sub">reference</span></td><td class="num">0.793</td><td class="num">0.745</td></tr>
-        <tr><td>… plus hourly HAR features</td><td class="num ns">0.795</td><td class="num ns">0.750</td></tr>
-        <tr><td>… plus path summary statistics</td><td class="num ns">0.794</td><td class="num ns">0.729</td></tr>
-        <tr><td>… plus hourly signature</td><td class="num neg">0.714</td><td class="num neg">0.680</td></tr>
-        <tr><td>HAR volatility forecast vs. the past level</td><td class="num ns">0.793</td><td class="num pos">0.754</td></tr>
-        <tr><td>Signature volatility forecast vs. the past level</td><td class="num ns">0.788</td><td class="num ns">0.751</td></tr>
-      </tbody>
-    </table></div>
-    <p class="cap">Colors compare with the reference, by block bootstrap (one-sided, 5%). Classifiers were fit on the same walk-forward folds with inner purged cross-validation.</p>
+  about 2,490 test days per pair; 0.5 is a coin flip.</p>
+  <div class="figure" id="fig4">
+    <div class="legend"><span><i class="dot" style="background:var(--s2)"></i>Logistic on HAR features</span><span><i class="dot" style="background:var(--s1)"></i>… plus the hourly signature</span></div>
+    <div class="panels">
+      <div><div class="panel-title">1 day</div><div id="c4a"></div></div>
+      <div><div class="panel-title">5 days</div><div id="c4b"></div></div>
+    </div>
+    <p class="cap">Adding the signature lowers the AUC on every pair and horizon. Not run on Bitcoin.</p>
   </div>
-  <p>Adding the signature's ~800 features to a logistic model lowers its AUC: it overfits more than it learns. Used
-  through the volatility forecast, the signature ranks direction about as well as HAR (0.751 vs 0.754).</p>
+  <p>About 800 signature features in a logistic model overfit more than they learn. Used through the volatility
+  forecast instead, the signature ranks direction about as well as HAR (EUR/USD 0.751 vs 0.754 at 5 days).</p>
 </section>
 
 <section>
   <div class="eyebrow">Finding 5 · Anomaly detection</div>
-  <h2>Signature anomaly scores don’t predict EUR/USD volatility surprises</h2>
-  <p>A day counts as a surprise when realized volatility lands in the top 20% relative to the HAR forecast. A
-  detector earns credit only for flagging those, not for finding days that are simply volatile. The test: the best
-  signature detector, picked on the first two folds, must beat the best signature-free detector on the last fold.</p>
-  <div class="figure">
-    <div class="tbl"><table>
-      <thead><tr><th>Asset · horizon</th><th class="num">Signature</th><th class="num">Signature-free</th><th class="num">p</th><th>Result</th></tr></thead>
-      <tbody>
-        <tr><td>Bitcoin · 1 hour</td><td class="num">0.545</td><td class="num">0.526</td><td class="num">0.06</td><td><span class="chip neu">Not passed</span></td></tr>
-        <tr><td>Bitcoin · 1 day</td><td class="num">0.582</td><td class="num">0.531</td><td class="num">0.04</td><td><span class="chip good">Passed</span></td></tr>
-        <tr><td>Bitcoin · 7 days</td><td class="num">0.500</td><td class="num">0.564</td><td class="num">0.84</td><td><span class="chip neu">Not passed</span></td></tr>
-        <tr><td>EUR/USD · 1 day</td><td class="num">0.488</td><td class="num">0.490</td><td class="num">0.50</td><td><span class="chip neu">Not passed</span></td></tr>
-        <tr><td>EUR/USD · 5 days</td><td class="num">0.527</td><td class="num">0.479</td><td class="num">0.18</td><td><span class="chip neu">Not passed</span></td></tr>
-      </tbody>
-    </table></div>
-    <p class="cap">Surprise AUC on the last (held-out) fold, within bands of the HAR forecast; 0.5 = no information beyond HAR. p: block bootstrap, one-sided.</p>
+  <h2>Signature anomaly scores flag Bitcoin surprises at 1 day, not EUR/USD ones</h2>
+  <p>A day counts as a surprise when realized volatility lands in the top 20% relative to the HAR forecast, so a
+  detector earns credit only for what HAR missed. The best signature detector, picked on the first two folds, must
+  beat the best signature-free detector on the last fold.</p>
+  <div class="figure" id="fig5">
+    <div class="legend"><span><i class="dot" style="background:var(--s1)"></i>Best signature detector</span><span><i class="dot" style="background:var(--ctl)"></i>Best signature-free detector</span></div>
+    <div id="c5"></div>
+    <p class="cap">Surprise AUC on the held-out fold; 0.5 = no information beyond HAR. Only Bitcoin at 1 day passes (block bootstrap p = 0.04). EUR/USD: p = 0.50 (1 day) and 0.18 (5 days).</p>
   </div>
   <ul>
-    <li>The detectors can see path shapes: on synthetic windows where only the order of returns is changed, the
-    selected signature detectors score AUC 0.86–0.95. The failure is in the data, not a blind spot in the method.</li>
-    <li>Used inside the volatility forecast, the anomaly score as a HAR correction improves on HAR by 2.5% (1 day) and
-    1.4% (5 days), but it ties with bias-corrected HAR (p = 0.99 and 0.55). A signature-free detector does the same.</li>
-    <li>One lead: at 5 days, every detector built on time-of-day-adjusted price plus spread held up on the last fold
-    (0.51–0.54), while plain price fell to 0.45–0.48. Not significant on one pair, but worth testing on others.</li>
+    <li>The detectors can see path shapes: on synthetic windows where only the order of returns is changed, they score
+    AUC 0.86–0.95. The failure is in the data, not a blind spot in the method.</li>
+    <li>Used inside the volatility forecast, the anomaly score improves on HAR by 2.5% (1 day) and 1.4% (5 days) but ties
+    with bias-corrected HAR (p = 0.99 and 0.55). A signature-free detector does the same.</li>
   </ul>
 </section>
 
 <section>
   <div class="eyebrow">Finding 6 · Four pairs, and pairs together</div>
-  <h2>The result holds on four pairs, and adding the other pairs to the path makes it worse</h2>
-  <p>We repeated the volatility forecasts on GBP/USD, USD/JPY and AUD/USD. Then we gave each pair's signature the
-  other three pairs' hourly prices, so its cross terms could pick up how the pairs move together and which one moves
-  first. A second variant added only a dollar factor, the dollar's average move against all four pairs.</p>
-  <div class="figure">
-    <div class="tbl"><table>
-      <thead><tr><th>Pair · horizon</th><th class="num">Own pair</th><th class="num">+ dollar factor</th><th class="num">+ other pairs</th><th class="num">HAR on hourly RV</th><th class="num">HAR, bias removed</th></tr></thead>
-      <tbody>
-        <tr><td>EUR/USD · 1 day</td><td class="num">+1.8%</td><td class="num">+0.5%</td><td class="num">−1.7%</td><td class="num">−0.4%</td><td class="num">+2.5%</td></tr>
-        <tr><td>GBP/USD · 1 day</td><td class="num">−1.0%</td><td class="num">−1.2%</td><td class="num">−2.1%</td><td class="num">+0.2%</td><td class="num">+1.7%</td></tr>
-        <tr><td>USD/JPY · 1 day</td><td class="num">−0.1%</td><td class="num">−2.0%</td><td class="num">−2.8%</td><td class="num">+0.2%</td><td class="num">+2.5%</td></tr>
-        <tr><td>AUD/USD · 1 day</td><td class="num">−0.8%</td><td class="num">−2.9%</td><td class="num">−4.2%</td><td class="num">−1.2%</td><td class="num">+1.4%</td></tr>
-        <tr><td>EUR/USD · 5 days</td><td class="num">−0.6%</td><td class="num">−4.1%</td><td class="num">−8.1%</td><td class="num">−1.4%</td><td class="num">+1.6%</td></tr>
-        <tr><td>GBP/USD · 5 days</td><td class="num">−1.3%</td><td class="num">−2.8%</td><td class="num">−6.2%</td><td class="num">+0.0%</td><td class="num">+1.2%</td></tr>
-        <tr><td>USD/JPY · 5 days</td><td class="num">−1.2%</td><td class="num">−4.4%</td><td class="num">−7.8%</td><td class="num">−0.1%</td><td class="num">+1.7%</td></tr>
-        <tr><td>AUD/USD · 5 days</td><td class="num">−3.1%</td><td class="num">−4.8%</td><td class="num">−8.5%</td><td class="num">−2.1%</td><td class="num">+0.7%</td></tr>
-      </tbody>
-    </table></div>
-    <p class="cap">% RMSE improvement over daily HAR, mean of 3 walk-forward folds; above zero is better. The first three columns are the signature model with each path. Signature inputs capped at 5 standard deviations (see below).</p>
+  <h2>The result holds on four pairs, and adding other pairs to the path makes it worse</h2>
+  <p>We repeated the forecasts on GBP/USD, USD/JPY and AUD/USD. Then we gave each pair's signature extra channels: a
+  dollar factor (the dollar's average move against all four pairs), or the other three pairs' hourly prices, so the
+  signature's cross terms could pick up how pairs move together and which one moves first.</p>
+  <div class="figure" id="fig6">
+    <div class="legend"><span><i style="background:var(--s1)"></i>Own pair</span><span><i style="background:var(--s4)"></i>+ dollar factor</span><span><i style="background:var(--s5)"></i>+ other three pairs</span></div>
+    <div class="panels">
+      <div><div class="panel-title">1 day</div><div id="c6a"></div></div>
+      <div><div class="panel-title">5 days</div><div id="c6b"></div></div>
+    </div>
+    <p class="cap">Signature model, % RMSE improvement over HAR. Every addition moves the bars left. Adding all three pairs is significantly worse than the own pair on 5 of 8 pair-horizons.</p>
+  </div>
+  <div class="figure heat">
+    <div class="fig-title">One other pair at a time</div>
+    <p class="cap" style="margin-top:-4px">Change from adding a single other pair, % RMSE vs the own pair alone. Green = it helped, red = it hurt; * = significant (p &lt; 0.05).</p>
+    <div class="panels">
+      <div class="tbl"><div class="panel-title">1 day</div><table id="h1"></table></div>
+      <div class="tbl"><div class="panel-title">5 days</div><table id="h5"></table></div>
+    </div>
+    <p class="cap">Worse in 18 of 24 combinations, significantly in 13. EUR/USD + GBP/USD, the most natural pairing, hurts EUR/USD. The only gains are on GBP/USD, none significant.</p>
   </div>
   <ul>
-    <li><strong>No pair beats HAR with its bias removed</strong>, in any variant. HAR fed hourly volatility ties plain HAR on every pair (−2.1% to +0.2%), so the hourly path holds little extra information across FX, not just on EUR/USD.</li>
-    <li><strong>The other pairs make every forecast worse</strong>: 1.1–7.6% worse than the own-pair signature, significantly so on 5 of the 8 pair-horizons. The dollar factor alone also hurts. Most of what the other pairs carry is the dollar move, and the pair's own price already reflects it. The extra features (about 2,400 instead of about 400) mostly add noise.</li>
-    <li><strong>One pair at a time doesn't help either.</strong> Adding a single other pair (about 800 features instead of about 2,400) still made the forecast worse in 18 of 24 pair combinations, significantly in 13. EUR/USD + GBP/USD, the most natural combination, is worse than EUR/USD alone (−1.6% at 1 day, −6.1% at 5 days). The only gains are small and not significant, all on GBP/USD (+0.2% to +1.2%). A smaller model hurts less, but the other pairs still add nothing the own pair lacks.</li>
-    <li><strong>The signature still beats raw lags</strong> with the same multi-pair data: +0.7% to +4.5%, significant at 1 day on GBP/USD, USD/JPY and AUD/USD. That makes four settings where this holds.</li>
-    <li><strong>One robustness lesson.</strong> Without the cap, GBP/USD forecasts were 36–51% worse than HAR. For weeks after the June 2016 Brexit vote, the signature saw the shock in its 22-day window and forecast 5-day volatility four to six times too high (0.09–0.11 against 0.02 realized). Capping standardized inputs at 5 standard deviations brings GBP/USD back in line with the other pairs (−1.0% and −1.3%), and it helps or is neutral elsewhere (AUD/USD at 5 days goes from −11.2% to −3.1%).</li>
+    <li><strong>No pair beats HAR with its bias removed</strong>, in any variant.</li>
+    <li><strong>Why adding pairs hurts.</strong> Most of what the other pairs carry is the dollar move, which the pair's own
+    price already shows, and each channel adds hundreds of signature features (about 400 own, 800 with one more, 2,400
+    with three) on about 3,300 training days. Smaller additions hurt less, but none helps.</li>
+    <li><strong>The signature still beats raw lags</strong> given the same multi-pair data (+0.7% to +4.5%, significant at 1
+    day on GBP/USD, USD/JPY and AUD/USD).</li>
   </ul>
+</section>
+
+<section>
+  <div class="eyebrow">Robustness</div>
+  <h2>One extreme event can wreck a signature model: the Brexit vote</h2>
+  <p>Our first GBP/USD run was 36–51% worse than HAR. The largest errors all fall in the weeks after the 23 June 2016
+  vote: the 22-day window still contained the shock, and the signature model forecast four to six times the volatility
+  that followed.</p>
+  <div class="figure" id="fig7">
+    <div class="legend"><span><i class="dot" style="background:var(--ink)"></i>Realized</span><span><i class="dot" style="background:var(--s2)"></i>HAR forecast</span><span><i class="dot" style="background:var(--s1)"></i>Signature forecast</span></div>
+    <div id="c7"></div>
+    <p class="cap">GBP/USD 5-day volatility (%), the eight days with the largest signature errors, before the fix.</p>
+  </div>
+  <div class="figure" id="fig8">
+    <div class="fig-title">The fix: cap each standardized input at 5 standard deviations</div>
+    <div class="legend"><span><i style="background:var(--ctl)"></i>No cap</span><span><i style="background:var(--s1)"></i>Capped</span></div>
+    <div id="c8"></div>
+    <p class="cap">Signature model on the original channels, % RMSE improvement over HAR. The cap brings GBP/USD in line with the other pairs and helps or is neutral elsewhere. We use it in every multi-pair run.</p>
+  </div>
 </section>
 
 <section>
@@ -274,9 +355,9 @@ details summary:focus-visible { outline: 2px solid var(--accent); outline-offset
       <h3 style="margin-bottom:8px">Where a gain is still plausible</h3>
       <ul>
         <li><strong>Longer horizons.</strong> On Bitcoin the gain grew with the horizon (+4.6% at 1 day, +15.4% at 30 days).
-        This EUR/USD run stopped at 5 days; a 22-day run is the most direct next test.</li>
+        The FX runs stop at 5 days; a 22-day run is the most direct next test.</li>
         <li><strong>Pooling pairs.</strong> Each pair gives about 3,300 training days. Training one model on all four pairs
-        multiplies the data, which the extra features in Finding 6 suggest is the binding limit.</li>
+        multiplies the data, which Finding 6 suggests is a binding limit.</li>
         <li><strong>Event information.</strong> FX volatility is driven by scheduled releases (payrolls, central-bank
         meetings) that no price path anticipates. A release calendar is the obvious missing input.</li>
       </ul>
@@ -296,12 +377,12 @@ details summary:focus-visible { outline: 2px solid var(--accent); outline-offset
 <section class="method">
   <div class="eyebrow">Method</div>
   <dl>
-    <dt>Data</dt><dd>EUR/USD hourly bid and ask candles from Dukascopy, 92,480 trading hours (Jan 2012 – Oct 2026), median spread 0.28 bp. FX days run 22:00–22:00 UTC.</dd>
-    <dt>Path</dt><dd>The last 22 trading days of hourly data. Depth-3 signature with time and lead-lag. Channels: time-of-day-adjusted price and range, activity, abnormal spread. Original channels for comparison.</dd>
-    <dt>Target</dt><dd>Realized volatility over the next 1 or 5 trading days, about 3,300 forecast days.</dd>
+    <dt>Data</dt><dd>Hourly bid and ask candles from Dukascopy for EUR/USD, GBP/USD, USD/JPY and AUD/USD, Jan 2012 – Oct 2026 (92,480 trading hours for EUR/USD, median spread 0.28 bp). FX days run 22:00–22:00 UTC.</dd>
+    <dt>Path</dt><dd>The last 22 trading days of hourly data. Depth-3 signature with time and lead-lag. Original channels (price, activity, range); EUR/USD also with time-of-day-adjusted price and range and the abnormal spread.</dd>
+    <dt>Target</dt><dd>Realized volatility over the next 1 or 5 trading days, about 3,300 forecast days per pair.</dd>
     <dt>Testing</dt><dd>3 expanding walk-forward folds, purged so no training target overlaps a test day. Settings fixed in advance. Diebold-Mariano tests for forecasts, block bootstrap for AUCs.</dd>
     <dt>Benchmarks</dt><dd>HAR-RV with a leverage term; HAR with its bias removed; HAR on hourly realized variance; signature-free features from the same window (matched lag bank, multiscale statistics).</dd>
-    <dt>Pairs</dt><dd>Same setup on GBP/USD, USD/JPY and AUD/USD. Pairs-together runs add the other pairs' hourly log prices (or a dollar factor) as extra path channels, with standardized ridge inputs capped at ±5 SD.</dd>
+    <dt>Pairs</dt><dd>Multi-pair runs add the other pairs' hourly log prices (all three, or one at a time) or a dollar factor as extra path channels, with standardized ridge inputs capped at ±5 SD.</dd>
     <dt>Bitcoin</dt><dd>Same pipeline on BTC/USDT (daily rows since 2015, hourly path since 2017), from the earlier notebooks.</dd>
     <dt>Code</dt><dd><code>vol_experiments_fx/vol_fx.ipynb</code> and <code>anomaly_fx.ipynb</code></dd>
   </dl>
@@ -311,62 +392,188 @@ details summary:focus-visible { outline: 2px solid var(--accent); outline-offset
 
 <script>
 (function () {
-  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const NS = "http://www.w3.org/2000/svg";
+  const fmt = (v, d = 1, unit = "%") => (v > 0 ? "+" : v < 0 ? "−" : "") + Math.abs(v).toFixed(d) + unit;
+  function svgEl(W, H, aria) {
+    const svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("width", "100%"); svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", aria);
+    const add = (tag, a, txt) => { const e = document.createElementNS(NS, tag); for (const k in a) e.setAttribute(k, a[k]); if (txt != null) e.textContent = txt; svg.appendChild(e); return e; };
+    return [svg, add];
+  }
+  function tipFor(el) {
+    const fig = el.closest(".figure");
+    return fig.querySelector(".tip") || (() => { const d = document.createElement("div"); d.className = "tip"; d.hidden = true; fig.appendChild(d); return d; })();
+  }
+  function hover(el, target, text) {
+    const tip = tipFor(el), fig = el.closest(".figure");
+    target.addEventListener("mousemove", ev => {
+      tip.hidden = false; tip.textContent = text;
+      const fb = fig.getBoundingClientRect();
+      tip.style.left = Math.min(ev.clientX - fb.left + 12, fb.width - 270) + "px"; tip.style.top = (ev.clientY - fb.top + 12) + "px";
+    });
+    target.addEventListener("mouseleave", () => tip.hidden = true);
+  }
+
+  // Horizontal grouped bars around zero. rows: [{label, values:[...]}] (null = not run)
   function bars(el, rows, series, opts) {
-    // rows: [{label, values:[...]}]; horizontal grouped bars around a zero line
-    const W = 340, padL = opts.padL || 64, padR = 44, barH = 11, gap = 2, groupGap = 16, top = 6;
+    const W = opts.W || 340, padL = opts.padL || 64, padR = 46, barH = 11, gap = 2, groupGap = 14, top = 6;
     const nS = series.length, gH = nS * barH + (nS - 1) * gap;
     const H = top + rows.length * gH + (rows.length - 1) * groupGap + 24;
     const [lo, hi] = opts.domain, x = v => padL + (v - lo) / (hi - lo) * (W - padL - padR);
-    const NS = "http://www.w3.org/2000/svg", svg = document.createElementNS(NS, "svg");
-    svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("width", "100%"); svg.setAttribute("role", "img");
-    svg.setAttribute("aria-label", opts.aria);
-    const add = (tag, a, txt) => { const e = document.createElementNS(NS, tag); for (const k in a) e.setAttribute(k, a[k]); if (txt != null) e.textContent = txt; svg.appendChild(e); return e; };
-    const plotB = H - 20;
+    const [svg, add] = svgEl(W, H, opts.aria);
     for (const t of opts.ticks) {
-      add("line", { x1: x(t), x2: x(t), y1: top - 4, y2: plotB, stroke: t === 0 ? "var(--ink-3)" : "var(--grid)", "stroke-width": t === 0 ? 1 : 1 });
+      add("line", { x1: x(t), x2: x(t), y1: top - 4, y2: H - 20, stroke: t === 0 ? "var(--ink-3)" : "var(--grid)", "stroke-width": 1 });
       add("text", { x: x(t), y: H - 6, "text-anchor": "middle" }, (t > 0 ? "+" : "") + t + "%");
     }
-    const tip = el.closest(".figure").querySelector(".tip") || (() => { const d = document.createElement("div"); d.className = "tip"; d.hidden = true; el.closest(".figure").appendChild(d); return d; })();
     rows.forEach((r, i) => {
       const y0 = top + i * (gH + groupGap);
       add("text", { x: 0, y: y0 + gH / 2 + 4, class: "lbl" }, r.label);
       r.values.forEach((v, j) => {
         if (v == null) return;
-        const y = y0 + j * (barH + gap), a = x(Math.min(0, v)), b = x(Math.max(0, v));
-        const w = Math.max(1, b - a), rr = 3;
-        // rounded on the data end only
+        const y = y0 + j * (barH + gap), a = x(Math.min(0, v)), b = x(Math.max(0, v)), w = Math.max(1, b - a), rr = 3;
         const d = v >= 0
           ? `M${a},${y} H${a + w - rr} Q${a + w},${y} ${a + w},${y + rr} V${y + barH - rr} Q${a + w},${y + barH} ${a + w - rr},${y + barH} H${a} Z`
           : `M${b},${y} H${b - w + rr} Q${b - w},${y} ${b - w},${y + rr} V${y + barH - rr} Q${b - w},${y + barH} ${b - w + rr},${y + barH} H${b} Z`;
         add("path", { d, fill: `var(${series[j].color})` });
-        const txt = (v > 0 ? "+" : v < 0 ? "−" : "") + Math.abs(v).toFixed(1) + "%";
-        add("text", { x: v >= 0 ? b + 4 : a - 4, y: y + barH - 2, "text-anchor": v >= 0 ? "start" : "end", class: "val" }, txt);
+        const txt = fmt(v), tw = txt.length * 6.7;
+        const left = v < 0 && a - 4 - tw >= padL;  // label left of a negative bar, else right of zero / the bar
+        add("text", { x: v >= 0 ? b + 4 : left ? a - 4 : x(0) + 4, y: y + barH - 2, "text-anchor": left ? "end" : "start", class: "val" }, txt);
         const hit = add("rect", { x: padL, y: y - 1, width: W - padL - padR, height: barH + 2, fill: "transparent" });
-        const show = ev => {
-          tip.hidden = false;
-          tip.textContent = `${opts.title} · ${r.label} · ${series[j].name}: ${txt} vs HAR`;
-          const fb = el.closest(".figure").getBoundingClientRect();
-          const px = (ev.clientX || fb.left + 40) - fb.left + 12, py = (ev.clientY || fb.top + 40) - fb.top + 12;
-          tip.style.left = Math.min(px, fb.width - 270) + "px"; tip.style.top = py + "px";
-        };
-        hit.addEventListener("mousemove", show); hit.addEventListener("mouseleave", () => tip.hidden = true);
+        hover(el, hit, `${opts.title ? opts.title + " · " : ""}${r.label} · ${series[j].name}: ${txt}${opts.suffix || ""}`);
       });
     });
     el.appendChild(svg);
   }
-  const S1 = [{ name: "Signature of hourly path", color: "--s1" }, { name: "HAR on hourly RV", color: "--s2" }];
+
+  // Dot plot: rows [{label, values:[...], group?}], one dot per series, joined by a thin line
+  function dots(el, rows, series, opts) {
+    const W = opts.W || 340, padL = opts.padL || 64, padR = 18, rowH = 24, top = 8;
+    const groups = rows.filter((r, i) => r.group && (i === 0 || rows[i - 1].group !== r.group)).length;
+    const H = top + rows.length * rowH + groups * 16 + 24;
+    const [lo, hi] = opts.domain, x = v => padL + (v - lo) / (hi - lo) * (W - padL - padR);
+    const [svg, add] = svgEl(W, H, opts.aria);
+    for (const t of opts.ticks) {
+      add("line", { x1: x(t), x2: x(t), y1: top - 4, y2: H - 20, stroke: t === opts.ref ? "var(--ink-3)" : "var(--grid)", "stroke-width": 1, "stroke-dasharray": t === opts.ref ? "3 3" : "" });
+      add("text", { x: x(t), y: H - 6, "text-anchor": "middle" }, opts.tick ? opts.tick(t) : t);
+    }
+    let y = top, last = null;
+    rows.forEach(r => {
+      if (r.group && r.group !== last) { add("text", { x: 0, y: y + 10, class: "grp" }, r.group.toUpperCase()); y += 16; last = r.group; }
+      const cy = y + rowH / 2;
+      add("text", { x: 0, y: cy + 4, class: "lbl" }, r.label);
+      const vs = r.values.filter(v => v != null);
+      add("line", { x1: x(Math.min(...vs)), x2: x(Math.max(...vs)), y1: cy, y2: cy, stroke: "var(--rule)", "stroke-width": 2 });
+      r.values.forEach((v, j) => {
+        if (v == null) return;
+        const c = add("circle", { cx: x(v), cy, r: 5, fill: `var(${series[j].color})`, stroke: "var(--panel)", "stroke-width": 2 });
+        const hit = add("circle", { cx: x(v), cy, r: 10, fill: "transparent" });
+        hover(el, hit, `${r.label} · ${series[j].name}: ${opts.val ? opts.val(v) : v}`);
+      });
+      if (r.note) add("text", { x: W - padR, y: cy - 7, "text-anchor": "end", class: "grp" }, r.note);
+      y += rowH;
+    });
+    el.appendChild(svg);
+  }
+
+  // Finding 1
+  const S1 = [{ name: "Signature", color: "--s1" }, { name: "HAR on hourly volatility", color: "--s2" }, { name: "HAR, bias removed", color: "--s3" }];
   bars(document.getElementById("c1a"), [
-    { label: "1 day", values: [4.6, 5.2] }, { label: "7 days", values: [10.7, 6.1] }, { label: "30 days", values: [15.4, 7.1] }
-  ], S1, { domain: [-8, 18], ticks: [-5, 0, 5, 10, 15], title: "Bitcoin", aria: "Bitcoin: signature +4.6, +10.7, +15.4 percent vs HAR at 1, 7, 30 days; hourly HAR +5.2, +6.1, +7.1" });
+    { label: "1 day", values: [4.6, 5.2, 8.2] }, { label: "7 days", values: [10.7, 6.1, 8.1] }, { label: "30 days", values: [15.4, 7.1, null] }
+  ], S1, { domain: [-8, 18], ticks: [-5, 0, 5, 10, 15], title: "Bitcoin", suffix: " vs HAR", aria: "Bitcoin, % better than HAR. Signature +4.6, +10.7, +15.4 at 1, 7, 30 days; HAR on hourly volatility +5.2, +6.1, +7.1; HAR bias removed +8.2, +8.1." });
   bars(document.getElementById("c1b"), [
-    { label: "1 day", values: [-1.2, -0.4] }, { label: "5 days", values: [-4.6, -1.4] }
-  ], S1, { domain: [-8, 18], ticks: [-5, 0, 5, 10, 15], title: "EUR/USD", aria: "EUR/USD: signature -1.2 and -4.6 percent vs HAR at 1 and 5 days; hourly HAR -0.4 and -1.4" });
-  const S3 = [{ name: "Signature", color: "--s1" }];
-  const ch = (a, b, c, d) => [
-    { label: "Original", values: [a] }, { label: "Adj. price only", values: [b] },
-    { label: "Adj., no spread", values: [c] }, { label: "Adj. + spread", values: [d] }];
-  bars(document.getElementById("c3a"), ch(1.7, -8.4, -0.0, -1.2), S3, { padL: 112, domain: [-30, 6], ticks: [-20, -10, 0], title: "1 day", aria: "1 day: original channels +1.7, adjusted price only -8.4, adjusted without spread 0.0, adjusted with spread -1.2 percent vs HAR" });
-  bars(document.getElementById("c3b"), ch(-0.8, -20.7, -2.1, -4.6), S3, { padL: 112, domain: [-30, 6], ticks: [-20, -10, 0], title: "5 days", aria: "5 days: original channels -0.8, adjusted price only -20.7, adjusted without spread -2.1, adjusted with spread -4.6 percent vs HAR" });
+    { label: "1 day", values: [-1.2, -0.4, 2.5] }, { label: "5 days", values: [-4.6, -1.4, 1.6] }
+  ], S1, { domain: [-8, 18], ticks: [-5, 0, 5, 10, 15], title: "EUR/USD", suffix: " vs HAR", aria: "EUR/USD, % better than HAR. Signature -1.2 and -4.6 at 1 and 5 days; HAR on hourly volatility -0.4 and -1.4; HAR bias removed +2.5 and +1.6." });
+  bars(document.getElementById("c1c"), [
+    { label: "BTC · 1 day", values: [5.2] }, { label: "BTC · 7 days", values: [6.1] }, { label: "BTC · 30 days", values: [7.1] },
+    { label: "EUR · 1 day", values: [-0.4] }, { label: "EUR · 5 days", values: [-1.4] },
+    { label: "GBP · 1 day", values: [0.2] }, { label: "GBP · 5 days", values: [0.0] },
+    { label: "JPY · 1 day", values: [0.2] }, { label: "JPY · 5 days", values: [-0.1] },
+    { label: "AUD · 1 day", values: [-1.2] }, { label: "AUD · 5 days", values: [-2.1] }
+  ], [{ name: "HAR on hourly volatility", color: "--s2" }], { W: 600, padL: 104, domain: [-4, 8], ticks: [-2, 0, 2, 4, 6, 8], suffix: " vs daily HAR", aria: "HAR on hourly volatility vs daily HAR: Bitcoin +5.2, +6.1, +7.1; FX pairs between -2.1 and +0.2." });
+
+  // Finding 2
+  bars(document.getElementById("c2"), [
+    { label: "BTC · 1 day", values: [12.5] }, { label: "BTC · 7 days", values: [13.6] },
+    { label: "EUR · 1 day", values: [5.7] }, { label: "EUR · 5 days", values: [10.4] },
+    { label: "JPY · 1 day", values: [8.5] }, { label: "JPY · 5 days", values: [11.1] },
+    { label: "AUD · 1 day", values: [9.7] }, { label: "AUD · 5 days", values: [12.4] }
+  ], [{ name: "Signature vs raw lags", color: "--s1" }], { W: 600, padL: 104, domain: [0, 16], ticks: [0, 5, 10, 15], suffix: " lower error than raw lags", aria: "Signature vs raw hourly lags, % lower error: Bitcoin +12.5 and +13.6; EUR/USD +5.7 and +10.4; USD/JPY +8.5 and +11.1; AUD/USD +9.7 and +12.4." });
+
+  // Finding 3
+  const ch = (a, b, c, d) => [{ label: "Original", values: [a] }, { label: "Adj. price only", values: [b] }, { label: "Adj., no spread", values: [c] }, { label: "Adj. + spread", values: [d] }];
+  const SS = [{ name: "Signature", color: "--s1" }];
+  bars(document.getElementById("c3a"), ch(1.7, -8.4, -0.0, -1.2), SS, { padL: 112, domain: [-30, 6], ticks: [-20, -10, 0], title: "1 day", suffix: " vs HAR", aria: "EUR/USD 1 day: original channels +1.7, adjusted price only -8.4, adjusted without spread 0.0, adjusted with spread -1.2 percent vs HAR" });
+  bars(document.getElementById("c3b"), ch(-0.8, -20.7, -2.1, -4.6), SS, { padL: 112, domain: [-30, 6], ticks: [-20, -10, 0], title: "5 days", suffix: " vs HAR", aria: "EUR/USD 5 days: original channels -0.8, adjusted price only -20.7, adjusted without spread -2.1, adjusted with spread -4.6 percent vs HAR" });
+
+  // Finding 4
+  const S4 = [{ name: "HAR features", color: "--s2" }, { name: "+ signature", color: "--s1" }];
+  const auc = { domain: [0.55, 0.85], ticks: [0.6, 0.7, 0.8], val: v => "AUC " + v.toFixed(3) };
+  dots(document.getElementById("c4a"), [
+    { label: "EUR/USD", values: [0.793, 0.714] }, { label: "GBP/USD", values: [0.787, 0.660] },
+    { label: "USD/JPY", values: [0.778, 0.680] }, { label: "AUD/USD", values: [0.801, 0.749] }
+  ], S4, { ...auc, aria: "Direction AUC at 1 day, HAR vs HAR plus signature: EUR 0.793 vs 0.714, GBP 0.787 vs 0.660, JPY 0.778 vs 0.680, AUD 0.801 vs 0.749" });
+  dots(document.getElementById("c4b"), [
+    { label: "EUR/USD", values: [0.745, 0.680] }, { label: "GBP/USD", values: [0.741, 0.612] },
+    { label: "USD/JPY", values: [0.724, 0.600] }, { label: "AUD/USD", values: [0.718, 0.598] }
+  ], S4, { ...auc, aria: "Direction AUC at 5 days, HAR vs HAR plus signature: EUR 0.745 vs 0.680, GBP 0.741 vs 0.612, JPY 0.724 vs 0.600, AUD 0.718 vs 0.598" });
+
+  // Finding 5
+  dots(document.getElementById("c5"), [
+    { group: "Bitcoin", label: "1 hour", values: [0.545, 0.526] },
+    { group: "Bitcoin", label: "1 day", values: [0.582, 0.531], note: "PASSED" },
+    { group: "Bitcoin", label: "7 days", values: [0.500, 0.564] },
+    { group: "EUR/USD", label: "1 day", values: [0.488, 0.490] },
+    { group: "EUR/USD", label: "5 days", values: [0.527, 0.479] }
+  ], [{ name: "Signature detector", color: "--s1" }, { name: "Signature-free detector", color: "--ctl" }],
+  { W: 600, padL: 70, domain: [0.44, 0.6], ticks: [0.45, 0.5, 0.55, 0.6], ref: 0.5, val: v => "AUC " + v.toFixed(3), aria: "Held-out surprise AUC, signature vs signature-free detector. Bitcoin 1 hour 0.545 vs 0.526, 1 day 0.582 vs 0.531 (passed), 7 days 0.500 vs 0.564; EUR/USD 1 day 0.488 vs 0.490, 5 days 0.527 vs 0.479." });
+
+  // Finding 6
+  const S6 = [{ name: "Own pair", color: "--s1" }, { name: "+ dollar factor", color: "--s4" }, { name: "+ other pairs", color: "--s5" }];
+  const pairsOpt = { padL: 64, domain: [-10, 4], ticks: [-8, -4, 0, 4], suffix: " vs HAR" };
+  bars(document.getElementById("c6a"), [
+    { label: "EUR/USD", values: [1.8, 0.5, -1.7] }, { label: "GBP/USD", values: [-1.0, -1.2, -2.1] },
+    { label: "USD/JPY", values: [-0.1, -2.0, -2.8] }, { label: "AUD/USD", values: [-0.8, -2.9, -4.2] }
+  ], S6, { ...pairsOpt, title: "1 day", aria: "1 day, % vs HAR for own pair, plus dollar factor, plus other pairs: EUR +1.8, +0.5, -1.7; GBP -1.0, -1.2, -2.1; JPY -0.1, -2.0, -2.8; AUD -0.8, -2.9, -4.2" });
+  bars(document.getElementById("c6b"), [
+    { label: "EUR/USD", values: [-0.6, -4.1, -8.1] }, { label: "GBP/USD", values: [-1.3, -2.8, -6.2] },
+    { label: "USD/JPY", values: [-1.2, -4.4, -7.8] }, { label: "AUD/USD", values: [-3.1, -4.8, -8.5] }
+  ], S6, { ...pairsOpt, title: "5 days", aria: "5 days, % vs HAR for own pair, plus dollar factor, plus other pairs: EUR -0.6, -4.1, -8.1; GBP -1.3, -2.8, -6.2; JPY -1.2, -4.4, -7.8; AUD -3.1, -4.8, -8.5" });
+
+  // One pair at a time heatmaps: [value, significant]
+  const P = ["EUR", "GBP", "JPY", "AUD"];
+  const H1 = { EUR: { GBP: [-1.63, 1], JPY: [-1.89, 1], AUD: [-2.01, 1] }, GBP: { EUR: [0.43, 0], JPY: [1.19, 0], AUD: [0.91, 0] },
+               JPY: { EUR: [-0.24, 0], GBP: [-1.78, 1], AUD: [-1.30, 1] }, AUD: { EUR: [-3.36, 1], GBP: [-2.70, 1], JPY: [-2.13, 1] } };
+  const H5 = { EUR: { GBP: [-6.15, 1], JPY: [-2.68, 1], AUD: [-4.17, 1] }, GBP: { EUR: [0.55, 0], JPY: [0.19, 0], AUD: [0.69, 0] },
+               JPY: { EUR: [-0.99, 0], GBP: [-3.21, 1], AUD: [-3.52, 1] }, AUD: { EUR: [-1.46, 0], GBP: [-1.97, 0], JPY: [-0.42, 0] } };
+  function heat(id, data, label) {
+    const t = document.getElementById(id);
+    let h = "<thead><tr><th>Target</th>" + P.map(p => `<th>+ ${p}</th>`).join("") + "</tr></thead><tbody>";
+    for (const r of P) {
+      h += `<tr><td>${r}</td>`;
+      for (const c of P) {
+        if (r === c) { h += '<td class="c self">–</td>'; continue; }
+        const [v, s] = data[r][c], pct = Math.round(12 + Math.min(1, Math.abs(v) / 6) * 58);
+        const col = v >= 0 ? "var(--good)" : "var(--bad)";
+        h += `<td class="c" style="background:color-mix(in srgb, ${col} ${pct}%, var(--panel))" title="${label}: ${r} + ${c}: ${fmt(v)} vs own pair${s ? ", significant" : ""}">${fmt(v)}${s ? "*" : ""}</td>`;
+      }
+      h += "</tr>";
+    }
+    t.innerHTML = h + "</tbody>";
+    t.setAttribute("aria-label", `${label}: change from adding one other pair, by target pair`);
+  }
+  heat("h1", H1, "1 day"); heat("h5", H5, "5 days");
+
+  // Robustness
+  const days = [["Jun 30", 1.92, 3.89, 8.99], ["Jul 5", 2.26, 2.90, 9.70], ["Jul 6", 2.15, 2.69, 10.68], ["Jul 7", 2.62, 2.49, 10.33],
+                ["Jul 18", 1.67, 2.84, 9.05], ["Jul 19", 1.60, 3.04, 9.22], ["Jul 20", 1.62, 2.79, 9.07], ["Jul 21", 1.63, 2.64, 8.75]];
+  dots(document.getElementById("c7"), days.map(d => ({ label: d[0] + " 2016", values: [d[1], d[2], d[3]] })),
+    [{ name: "Realized", color: "--ink" }, { name: "HAR forecast", color: "--s2" }, { name: "Signature forecast", color: "--s1" }],
+    { W: 600, padL: 92, domain: [0, 12], ticks: [0, 2, 4, 6, 8, 10, 12], tick: t => t + "%", val: v => v.toFixed(2) + "%", aria: "GBP/USD 5-day volatility in July 2016: realized about 1.6 to 2.6 percent, HAR forecast 2.5 to 3.9 percent, signature forecast 8.8 to 10.7 percent." });
+  bars(document.getElementById("c8"), [
+    { label: "GBP/USD · 1 day", values: [-35.7, -1.0] }, { label: "GBP/USD · 5 days", values: [-51.0, -1.3] },
+    { label: "AUD/USD · 5 days", values: [-11.2, -3.1] }, { label: "EUR/USD · 1 day", values: [1.7, 1.8] }
+  ], [{ name: "No cap", color: "--ctl" }, { name: "Capped", color: "--s1" }],
+  { W: 600, padL: 120, domain: [-56, 6], ticks: [-50, -40, -30, -20, -10, 0], suffix: " vs HAR", aria: "Signature vs HAR without and with the cap: GBP/USD 1 day -35.7 to -1.0, 5 days -51.0 to -1.3; AUD/USD 5 days -11.2 to -3.1; EUR/USD 1 day +1.7 to +1.8." });
 })();
 </script>
