@@ -67,6 +67,11 @@ Pairs together (section 10, all with clipped inputs), % better than HAR:
   signature, significant on 5 of 8 pair-horizons. The dollar factor alone also hurts. Likely reason: the
   other pairs mostly carry the dollar move the own price already shows, and the features grow from about
   400 to about 2,400 on 3,300 training days.
+- **One other pair at a time (section 10b) doesn't help either.** With about 800 features instead of about
+  2,400, adding a single pair still makes the forecast worse in 18 of 24 combinations, significantly in 13.
+  EUR/USD + GBP/USD is worse than EUR/USD alone (−1.6% at 1 day, −6.1% at 5 days). The only gains are on
+  GBP/USD (+0.2% to +1.2%), none significant. Smaller paths hurt less than all three pairs, so size is part
+  of it, but there is no cross-pair information to recover.
 - **The signature still beats the lag bank with the same multi-pair data** (+0.7% to +4.5%, significant at
   1 day on GBP/USD, USD/JPY, AUD/USD). The "better summary of the path" result holds in every setting.
 - **Best signature result anywhere in FX**: EUR/USD own pair, 1 day, +1.8% vs HAR, still below HAR with its
