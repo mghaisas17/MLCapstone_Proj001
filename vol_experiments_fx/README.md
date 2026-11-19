@@ -28,7 +28,7 @@ finished horizons are skipped, so re-running a notebook only computes what is mi
 **More pairs**: section 9 of `vol_fx.ipynb` runs the same experiment on GBP/USD, USD/JPY and AUD/USD
 (results in `results/pairs/<pair>/`; EUR/USD reuses the main run). The first run downloads about 360
 files per pair. Section 10 runs the **pairs together**: each pair's path also carries the other pairs'
-prices (and, in a second variant, a dollar factor), to see whether the signature's cross terms find
+prices (and, in a second variant, a dollar factor; section 10b adds one other pair at a time), to see whether the signature's cross terms find
 information one pair alone does not have (results in `results/cross/<pair>/`).
 
 ## Notes for the write-up

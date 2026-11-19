@@ -179,6 +179,12 @@ def test_cross(tmp: Path, h: pd.DataFrame, cfg: ex.ExperimentConfig):
             assert cc.ridge_clip == L.RIDGE_CLIP and (v == "own") == (not cc.cross_pairs)
             ex.run_all(cc)
             cfgs[v] = cc
+        v = L.with_variant("GBPUSD")  # section 10b: one other pair at a time
+        pts = {hk: {"intraday_dims": L.cross_dims("EURUSD", v), "intraday_path_points": 24} for hk in L.HORIZONS}
+        single = L.cross_config("EURUSD", v, output_dir=str(tmp / "cross" / v), spec_overrides=pts, **keep)
+        assert single.cross_pairs == ("GBPUSD",) and L.cross_dims("EURUSD", v) == L.OWN_DIMS + ("x:GBPUSD",)
+        assert L.single_variants("EURUSD") == ("own", "with_GBPUSD", "with_USDJPY", "with_AUDUSD")
+        ex.run_all(single)
     finally:
         ex.fetch_dukascopy_hourly = saved
     res = L.load_cross({"EURUSD": cfgs})["EURUSD"]
@@ -189,6 +195,9 @@ def test_cross(tmp: Path, h: pd.DataFrame, cfg: ex.ExperimentConfig):
     assert "Signature | own pair" in set(t.columns.get_level_values(0))
     plt.close(L.plot_cross(level))
     assert len(L.worst_errors(res, "Signature | + other pairs", n=3)) == 6
+    sres = L.load_cross({"EURUSD": {"own": cfgs["own"], "with_GBPUSD": single}})
+    st = L.cross_single_table(sres)
+    assert len(st) == 2 and set(st["Added pair"]) == {"GBPUSD"} and st[["Pct_vs_HAR", "Pct_vs_own", "DM_p_vs_own"]].notna().all().all()
     # clipping: an extreme test row cannot push the forecast far outside the training range
     X = rng.normal(size=(300, 5)); y = X[:, 0] + rng.normal(0, .1, 300)
     t_ = pd.date_range("2020", periods=300, freq="D").to_numpy()

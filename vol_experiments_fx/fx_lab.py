@@ -107,6 +107,16 @@ OWN_DIMS = ("price", "activity", "range")
 RIDGE_CLIP = 5.0  # standardized features clipped to +-5 SD of the training rows
 CROSS_VARIANTS = ("own", "usd", "pairs")
 CROSS_LABELS = {"own": "own pair", "usd": "+ dollar factor", "pairs": "+ other pairs"}
+# One other pair at a time (section 10b): variant "with_GBPUSD" = own channels + GBP/USD's log price.
+# About 800 signature features instead of about 2,400 with all three pairs.
+
+
+def with_variant(pair: str) -> str:
+    return f"with_{pair}"
+
+
+def cross_label(variant: str) -> str:
+    return CROSS_LABELS.get(variant) or "+ " + variant.removeprefix("with_")
 CROSS_BASELINES = ("Mean", "HAR-RV-L", "HAR-RV-L calibrated", "HAR-RV-L (intraday RV)",
                    "Ridge | intraday multiscale stats")
 CROSS_PATH_MODELS = ("Ridge | intraday signature", "Ridge | intraday lag bank (matched)",
@@ -146,7 +156,18 @@ def pair_vol_config(symbol: str, quick: bool = False, **changes) -> ex.Experimen
 
 def cross_dims(symbol: str, variant: str) -> tuple:
     others = tuple(p for p in PAIRS if p != symbol)
+    if variant.startswith("with_"):
+        return OWN_DIMS + (f"x:{variant.removeprefix('with_')}",)
     return {"own": OWN_DIMS, "usd": OWN_DIMS + ("usd",), "pairs": OWN_DIMS + tuple(f"x:{p}" for p in others)}[variant]
+
+
+def _cross_pairs_for(symbol: str, variant: str) -> tuple:
+    """The other pairs whose prices a variant needs joined to ``symbol``'s bars."""
+    if variant == "own":
+        return ()
+    if variant.startswith("with_"):
+        return (variant.removeprefix("with_"),)
+    return tuple(p for p in PAIRS if p != symbol)
 
 
 def cross_config(symbol: str, variant: str, quick: bool = False, **changes) -> ex.ExperimentConfig:
@@ -155,7 +176,7 @@ def cross_config(symbol: str, variant: str, quick: bool = False, **changes) -> e
     dims = cross_dims(symbol, variant)
     models = (CROSS_BASELINES if variant == "own" else ()) + CROSS_PATH_MODELS
     changes = {
-        "fx_symbol": symbol, "cross_pairs": tuple(p for p in PAIRS if p != symbol) if variant != "own" else (),
+        "fx_symbol": symbol, "cross_pairs": _cross_pairs_for(symbol, variant),
         "ridge_clip": RIDGE_CLIP, "models": models, "run_ablations": False, "intraday_ablation_dims": {},
         "spec_overrides": {h: {"intraday_dims": dims} for h in HORIZONS},
         "output_dir": str(RESULTS / "cross" / symbol / (variant + ("_quick" if quick else ""))),
@@ -376,16 +397,17 @@ def plot_pairs(level: pd.DataFrame, cols=("Signature", "Signature, original chan
 # ---------------------------------------------------------------- pairs together (interaction)
 
 
-def run_cross(pairs=PAIRS, quick: bool = False, subprocess_per_horizon: bool = True, **changes) -> dict:
+def run_cross(pairs=PAIRS, quick: bool = False, subprocess_per_horizon: bool = True, variants=CROSS_VARIANTS,
+              **changes) -> dict:
     """Run the three variants for each pair (own / + dollar factor / + other pairs). Every pair's
     data must be downloaded (section 9 does that). Finished runs are skipped. Returns
     {pair: {variant: config}}."""
     cfgs = {}
     for sym in pairs:
         cfgs[sym] = {}
-        for v in CROSS_VARIANTS:
+        for v in (variants(sym) if callable(variants) else variants):
             cfg = cross_config(sym, v, quick, **changes)
-            LOGGER.info("==== %s | %s ====", sym, CROSS_LABELS[v])
+            LOGGER.info("==== %s | %s ====", sym, cross_label(v))
             ex.run_all(cfg, subprocess_per_horizon=subprocess_per_horizon)
             cfgs[sym][v] = cfg
     return cfgs
@@ -411,7 +433,7 @@ def load_cross(cfgs: dict) -> dict:
             m, p = r.metrics.copy(), r.predictions.copy()
             for df in (m, p):
                 path = df.Model.isin(_CROSS_SHORT)
-                df.loc[path, "Model"] = df.loc[path, "Model"].map(_CROSS_SHORT) + " | " + CROSS_LABELS[v]
+                df.loc[path, "Model"] = df.loc[path, "Model"].map(_CROSS_SHORT) + " | " + cross_label(v)
             t = p.groupby("Horizon").Time.apply(lambda x: tuple(sorted(x.unique())))
             if times is not None and not t.equals(times):
                 raise RuntimeError(f"{sym}: the {v} run has different rows from the own run")
@@ -455,6 +477,37 @@ def cross_test_table(results: dict) -> pd.DataFrame:
     t = pd.concat(frames, ignore_index=True)
     wide = t.pivot_table(index=["Horizon", "Pair"], columns="Versus", values=["Pct_better", "DM_p"], sort=False)
     return wide.swaplevel(0, 1, axis=1).sort_index(axis=1, level=0, sort_remaining=False)
+
+
+def single_variants(symbol: str) -> tuple:
+    """Section 10b: the own-pair run (shared with section 10) plus one run per other pair."""
+    return ("own",) + tuple(with_variant(p) for p in PAIRS if p != symbol)
+
+
+def run_cross_single(pairs=PAIRS, quick: bool = False, **kw) -> dict:
+    """Each pair with one other pair at a time. The own-pair run is section 10's (skipped if done)."""
+    return run_cross(pairs, quick, variants=single_variants, **kw)
+
+
+def cross_single_table(results: dict) -> pd.DataFrame:
+    """One row per target pair, horizon and added pair: the signature with that one pair added, as
+    % better than HAR-RV-L, and against the own-pair signature on identical rows (pooled RMSE %
+    better, > 0 = adding the pair helps, and the Diebold-Mariano p)."""
+    own = f"Signature | {CROSS_LABELS['own']}"
+    rows = []
+    for sym, res in results.items():
+        s = rp.summary_table(res)
+        s["Horizon"] = s.Horizon.astype(str)
+        pct = s.set_index(["Horizon", "Model"]).Pct_vs_HAR
+        added = [p for p in PAIRS if p != sym and f"Signature | + {p}" in set(res.metrics.Model)]
+        t = rp.pair_table(res, [(f"Signature | + {p}", [own]) for p in added])
+        t["Horizon"] = t.Horizon.astype(str)
+        for _, r in t.iterrows():
+            rows.append({"Pair": sym, "Horizon": r.Horizon, "Added pair": r.Model.split("+ ")[1],
+                         "Pct_vs_HAR": pct.get((r.Horizon, r.Model), np.nan),
+                         "Own pair Pct_vs_HAR": pct.get((r.Horizon, own), np.nan),
+                         "Pct_vs_own": r.Pct_better, "DM_p_vs_own": r.DM_p})
+    return pd.DataFrame(rows)
 
 
 def plot_cross(level: pd.DataFrame):
