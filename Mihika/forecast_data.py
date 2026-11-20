@@ -48,6 +48,9 @@ class ForecastSpec:
     intraday_freq: str | None = None
     intraday_dims: tuple | None = None  # None -> same as `dims`
     intraday_path_points: int | None = None  # None -> native intraday resolution
+    # "sig": the signature; "logsig": the log-signature (same information, no redundant terms:
+    # 140 instead of 399 features for a 7-dimensional path at depth 3)
+    sig_kind: str = "sig"
 
 
 SPECS: dict[str, ForecastSpec] = {
@@ -614,17 +617,32 @@ def make_path(window: pd.DataFrame, spec: ForecastSpec) -> np.ndarray:
     return path.astype(np.float64)
 
 
-def signature_features(path: np.ndarray, depth: int) -> np.ndarray:
+_LOGSIG_PREP: dict = {}
+
+
+def _logsig_prep(dim: int, depth: int):
+    if (dim, depth) not in _LOGSIG_PREP:
+        _LOGSIG_PREP[(dim, depth)] = iisignature.prepare(dim, depth)
+    return _LOGSIG_PREP[(dim, depth)]
+
+
+def signature_features(path: np.ndarray, depth: int, kind: str = "sig") -> np.ndarray:
+    """Signature (``kind="sig"``) or log-signature (``"logsig"``, Lyndon basis) of a path, or of a
+    batch of paths (n, length, dim). Both list level 1 first, then level 2, ..."""
+    if kind == "logsig":
+        return iisignature.logsig(path, _logsig_prep(path.shape[-1], depth)).astype(np.float32)
+    if kind != "sig":
+        raise ValueError(f"unknown signature kind {kind!r} (use 'sig' or 'logsig')")
     return iisignature.sig(path, depth).astype(np.float32)
 
 
-def signature_info(path: np.ndarray, depth: int) -> dict[str, int]:
+def signature_length(dim: int, depth: int, kind: str = "sig") -> int:
+    return int(iisignature.logsiglength(dim, depth) if kind == "logsig" else iisignature.siglength(dim, depth))
+
+
+def signature_info(path: np.ndarray, depth: int, kind: str = "sig") -> dict[str, int]:
     d = path.shape[1]
-    return {
-        "path_dimension": d,
-        "depth": depth,
-        "signature_features": int(iisignature.siglength(d, depth)),
-    }
+    return {"path_dimension": d, "depth": depth, "signature_features": signature_length(d, depth, kind)}
 
 
 def lag_bank_features(window: pd.DataFrame, spec: ForecastSpec, n_target: int) -> np.ndarray:
@@ -802,7 +820,7 @@ def chunk_signatures(window: pd.DataFrame, sub_window_steps: int, spec: Forecast
     n_chunks = max(1, len(window) // sub_window_steps)
     chunks = [window.iloc[k * sub_window_steps : (k + 1) * sub_window_steps] for k in range(n_chunks)]
     return np.stack(
-        [signature_features(make_path(chunk, spec), spec.depth) for chunk in chunks if len(chunk) >= 2]
+        [signature_features(make_path(chunk, spec), spec.depth, spec.sig_kind) for chunk in chunks if len(chunk) >= 2]
     )
 
 
@@ -906,7 +924,7 @@ def build_dataset(
 
         window = bars.iloc[i - lookback_steps + 1 : i + 1]
         path = make_path(window, spec)
-        sig = signature_features(path, spec.depth)
+        sig = signature_features(path, spec.depth, spec.sig_kind)
 
         times.append(bars.index[i])
         target_ends.append(bars.index[i + horizon_steps])
@@ -924,7 +942,7 @@ def build_dataset(
             ispec = replace(
                 spec, dims=tuple(spec.intraday_dims or spec.dims), path_points=spec.intraday_path_points
             )
-            isig = signature_features(make_path(iw, ispec), spec.depth)
+            isig = signature_features(make_path(iw, ispec), spec.depth, spec.sig_kind)
             isig_list.append(isig)
             ilag_list.append(lag_bank_features(iw, ispec, isig.shape[0]))
             imulti_list.append(multiscale_features(iw))

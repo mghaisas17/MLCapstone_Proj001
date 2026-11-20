@@ -92,6 +92,7 @@ class AnomalyConfig:
     # FX only: also load the bid-ask spread and the time-of-day-adjusted channels, which the
     # price_sa / range_sa / spread channel sets need
     fx_channels: bool = False
+    sig_kind: str = "sig"  # "sig" or "logsig" (log-signature: same information, fewer terms)
     target_rows: dict = field(default_factory=lambda: {"1h": 20000, "1d": None, "7d": None})
 
     # Stage A grid (cheap detectors)

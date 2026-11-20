@@ -118,7 +118,7 @@ def _run_rep(rep, detectors, bars, rows, folds, labels, spec, cfg, out, done: se
         return m_df, pd.read_parquet(part_s)
     W = int(round(spec.window * rep.window_mult))
     win = extract_windows(bars, rows.pos, W, rep.normalize)
-    reps = representations(win, rep, spec, cfg.depths, cfg.max_sig_features)
+    reps = representations(win, rep, spec, cfg.depths, cfg.max_sig_features, kind=cfg.sig_kind)
     metrics, scores = [], []
     for rep_name, X in reps.items():
         key = _config_key(rep_name, rep)
@@ -167,12 +167,12 @@ def synthetic_check(choice: dict, bars, rows, folds, spec, cfg) -> dict:
     W = int(round(spec.window * rep.window_mult))
     win = extract_windows(bars, rows.pos, W, rep.normalize)
     rep_name = choice["Config"].split(" | ")[0]
-    X = representations(win, rep, spec, cfg.depths, cfg.max_sig_features)[rep_name]
+    X = representations(win, rep, spec, cfg.depths, cfg.max_sig_features, kind=cfg.sig_kind)[rep_name]
     model = det.make(choice["Detector"], cfg).fit(X[fold.train])
     rng = np.random.default_rng(cfg.seed)
     sample = np.sort(rng.choice(fold.test, size=min(2000, len(fold.test)), replace=False))
     sub, injected = reorder_injection(win, sample, cfg.seed)
-    Xs = representations(sub, rep, spec, cfg.depths, cfg.max_sig_features)[rep_name]
+    Xs = representations(sub, rep, spec, cfg.depths, cfg.max_sig_features, kind=cfg.sig_kind)[rep_name]
     from sklearn.metrics import roc_auc_score
 
     return {"AUC_injected": float(roc_auc_score(injected, model.score(Xs)))}

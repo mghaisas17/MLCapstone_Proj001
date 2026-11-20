@@ -53,6 +53,7 @@ from forecast_data import (
     fx_cross_channels,
     fx_hourly_channels,
     load_or_download_yahoo,
+    signature_length,
 )
 from models_and_metrics import (
     EPS,
@@ -575,7 +576,8 @@ def _anomaly_scores(ctx, which: str) -> np.ndarray:
             W = int(round(spec.window * rep.window_mult))
             valid &= pos >= 2 * W - 1  # the trailing-vol normalization needs W earlier bars
             win = AF.extract_windows(bars, pos[valid], W, rep.normalize)
-            X = AF.representations(win, rep, spec, acfg.depths, acfg.max_sig_features)[choice["Config"].split(" | ")[0]]
+            X = AF.representations(win, rep, spec, acfg.depths, acfg.max_sig_features,
+                                   kind=getattr(acfg, "sig_kind", "sig"))[choice["Config"].split(" | ")[0]]
         ctx.flag_cache[cache_key] = (X, valid)
     X, valid = ctx.flag_cache[cache_key]
 
@@ -996,9 +998,9 @@ def with_target(ds: ForecastDataset, target: str, intraday: pd.DataFrame, spec: 
 
 
 def signature_level_slices(spec: ForecastSpec) -> dict[str, slice]:
+    """Levels 1..k of the (log-)signature are its first signature_length(dim, k) columns."""
     dim = len(spec.dims) * (2 if spec.lead_lag else 1) + int(spec.time_aug)
-    ends = np.cumsum([dim**k for k in range(1, spec.depth + 1)])
-    return {f"L1-{k}": slice(0, int(end)) for k, end in enumerate(ends, 1)}
+    return {f"L1-{k}": slice(0, signature_length(dim, k, spec.sig_kind)) for k in range(1, spec.depth + 1)}
 
 
 def dimension_variants(horizon: str) -> dict[str, tuple]:

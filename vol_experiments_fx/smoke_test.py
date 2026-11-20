@@ -265,6 +265,43 @@ def test_anomaly(tmp: Path, h: pd.DataFrame, cfg: ex.ExperimentConfig):
     ok("anomaly on more pairs: per-pair study, cross-pair gate and channels, score in each pair's forecasts")
 
 
+def test_logsig(tmp: Path, h: pd.DataFrame):
+    """Log-signatures: the switch, feature sizes, levels as prefixes, a vol run and an anomaly run."""
+    import iisignature
+
+    path = np.cumsum(np.random.default_rng(2).normal(size=(40, 7)), axis=0)
+    full, two = fd.signature_features(path, 3, "logsig"), fd.signature_features(path, 2, "logsig")
+    assert full.shape == (140,) and np.allclose(full[:28], two)  # level 1-2 = the first 28 terms
+    assert fd.signature_length(9, 3, "logsig") == 285 and fd.signature_length(7, 3) == 399
+    assert AF.sig_length(7, 3, "logsig") == 140 and AF.level_slice(7, 2, "logsig") == slice(0, 28)
+    root = L.use_log_signatures(True)
+    try:
+        assert root.name == "results_logsig" and L.vol_config().output_dir.endswith("results_logsig/vol")
+        assert all(o["sig_kind"] == "logsig" for o in L.vol_config().spec_overrides.values())
+        assert L.cross_config("GBPUSD", "pairs").spec_overrides["1d_i"]["sig_kind"] == "logsig"
+        assert L.anomaly_config().sig_kind == "logsig"
+        ex._INTRADAY_MEMO.clear()
+        over = {k: {"intraday_dims": L.MAIN_DIMS, "intraday_path_points": 24} for k in L.HORIZONS}
+        cfg = L.vol_config(fx_start="2022-01-01", intraday_end=None, torch_epochs=2, spec_overrides=over,
+                           models=("Mean", "HAR-RV-L", "Ridge | intraday signature", "Ridge | intraday lag bank (matched)"),
+                           data_dir=str(tmp / "data"), cache_dir=str(tmp / "cache"), output_dir=str(tmp / "ls_vol"))
+        res = rp.load_results(ex.run_all(cfg))
+        ds, spec, folds, hs = L.horizon_dataset(cfg, "1d_i")
+        assert spec.sig_kind == "logsig" and ds.X_isig.shape[1] == 285 and ds.X_ilag.shape[1] == 285
+        abl = L.ablation_table(res)
+        assert set(abl[abl.Experiment == "Signature level"].Setting) == {"L1-1", "L1-2", "L1-3"}
+        assert ex.signature_level_slices(replace(spec, dims=L.MAIN_DIMS))["L1-2"] == slice(0, 45)
+        acfg = L.anomaly_config(start="2022-01-01", end=None, min_train_rows=60, n_bootstrap=20, stage_b_top_k=1,
+                                channel_sets=("price", "price_sa+spread"), data_dir=str(tmp / "data"),
+                                output_dir=str(tmp / "ls_anomaly"))
+        ares = AR.load_results(ARUN.run_all(acfg))
+        assert len(AR.gate_table(ares)) == 2
+    finally:
+        L.use_log_signatures(False)
+    assert L.vol_config().output_dir.endswith("results/vol") and L.anomaly_config().sig_kind == "sig"
+    ok("log-signatures: switch, sizes (140 / 285), levels as prefixes, vol run with ablations, anomaly run")
+
+
 if __name__ == "__main__":
     h = synthetic_fx()
     for mod in (ex, ARUN, L):  # every loader gets the synthetic bars (with the spread)
@@ -276,4 +313,5 @@ if __name__ == "__main__":
         test_pairs(tmp, cfg)
         test_cross(tmp, h, cfg)
         test_anomaly(tmp, h, cfg)
+        test_logsig(tmp, h)
     print("\nALL FX SMOKE CHECKS PASSED")

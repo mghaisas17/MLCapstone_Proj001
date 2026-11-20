@@ -31,6 +31,11 @@ files per pair. Section 10 runs the **pairs together**: each pair's path also ca
 prices (and, in a second variant, a dollar factor; section 10b adds one other pair at a time), to see whether the signature's cross terms find
 information one pair alone does not have (results in `results/cross/<pair>/`).
 
+**Log-signatures**: set `LOG_SIGNATURES = True` in the setup cell of either notebook to rerun everything
+with the log-signature (same information as the signature, no redundant terms: 140 / 285 / 819 features
+on paths of 3 / 4 / 6 channels, instead of 399 / 819 / 2,379). Results go to `results_logsig/`; section 11
+of `vol_fx.ipynb` and section 8 of `anomaly_fx.ipynb` compare them with the signature runs.
+
 ## Notes for the write-up
 
 Conclusions from the EUR/USD run (Oct 2026) to carry into the report. Each holds on both BTC and EUR/USD

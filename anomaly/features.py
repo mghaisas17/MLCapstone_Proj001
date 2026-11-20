@@ -136,19 +136,29 @@ def augment(path: np.ndarray, lead_lag: bool) -> np.ndarray:
     return np.concatenate([t, path], axis=2)
 
 
-def sig_length(dim: int, depth: int) -> int:
+def sig_length(dim: int, depth: int, kind: str = "sig") -> int:
+    """Number of (log-)signature terms up to ``depth``; levels are stored in order, so the first
+    sig_length(dim, k) columns are levels 1..k."""
+    if kind == "logsig":
+        import iisignature
+
+        return int(iisignature.logsiglength(dim, depth))
     return sum(dim**k for k in range(1, depth + 1))
 
 
-def level_slice(dim: int, depth: int) -> slice:
-    return slice(0, sig_length(dim, depth))
+def level_slice(dim: int, depth: int, kind: str = "sig") -> slice:
+    return slice(0, sig_length(dim, depth, kind))
 
 
-def signature(path: np.ndarray, depth: int, batch: int = 2000) -> np.ndarray:
+def signature(path: np.ndarray, depth: int, batch: int = 2000, kind: str = "sig") -> np.ndarray:
     import iisignature
 
-    out = [np.asarray(iisignature.sig(path[i : i + batch], depth), dtype=np.float32)
-           for i in range(0, len(path), batch)]
+    if kind == "logsig":
+        prep = iisignature.prepare(path.shape[2], depth)
+        fn = lambda x: iisignature.logsig(x, prep)
+    else:
+        fn = lambda x: iisignature.sig(x, depth)
+    out = [np.asarray(fn(path[i : i + batch]), dtype=np.float32) for i in range(0, len(path), batch)]
     return np.concatenate(out, axis=0)
 
 
@@ -218,7 +228,7 @@ def raw(win: dict, channels: tuple, blocks: int = 32) -> np.ndarray:
 # ---------------------------------------------------------------- all representations for one RepConfig
 
 
-def representations(win: dict, rep, spec, depths, max_features: int) -> dict:
+def representations(win: dict, rep, spec, depths, max_features: int, kind: str = "sig") -> dict:
     """{name: matrix} for one path recipe: signatures at each allowed depth, the lag bank
     matched to the deepest signature computed, stats, and raw."""
     from .config import CHANNEL_SETS
@@ -227,12 +237,12 @@ def representations(win: dict, rep, spec, depths, max_features: int) -> dict:
     base = base_paths(win, channels, spec.path_points)
     path = augment(base, rep.lead_lag)
     dim = path.shape[2]
-    allowed = [d for d in sorted(depths) if sig_length(dim, d) <= max_features]
+    allowed = [d for d in sorted(depths) if sig_length(dim, d, kind) <= max_features]
     out = {}
     if allowed:
-        full = signature(path, allowed[-1])
+        full = signature(path, allowed[-1], kind=kind)
         for d in allowed:
-            out[f"signature d{d}"] = full[:, level_slice(dim, d)]
+            out[f"signature d{d}"] = full[:, level_slice(dim, d, kind)]
         out["lag bank"] = lag_bank(base, out[f"signature d{allowed[-1]}"].shape[1])
     out["stats"] = stats(win)
     out["raw"] = raw(win, channels)

@@ -39,10 +39,24 @@ from forecast_data import duration_steps, fetch_dukascopy_hourly, fx_hourly_chan
 LOGGER = logging.getLogger(__name__)
 
 RESULTS = HERE / "results"
+# "sig" (signatures) or "logsig" (log-signatures). Switch with use_log_signatures(); every config made
+# afterwards uses it, and log-signature runs go to results_logsig/ so the signature results stay.
+SIG_KIND = "sig"
 DATA_DIR = ROOT / "Mihika" / "data"  # the Dukascopy download cache shared with the other notebooks
 CACHE_DIR = HERE / "cache"  # feature datasets built by this folder's runs
 SYMBOL = "EURUSD"
 START = "2012-01-01"
+
+
+def use_log_signatures(on: bool = True) -> str:
+    """Use log-signatures (``on``) or signatures everywhere: the vol runs, the pairs, the pairs-together
+    runs and the anomaly study. Log-signature results go to results_logsig/. Call it once, right
+    after importing fx_lab, before making any config. Returns the results folder."""
+    global SIG_KIND, RESULTS
+    SIG_KIND = "logsig" if on else "sig"
+    RESULTS = HERE / ("results_logsig" if on else "results")
+    LOGGER.info("Using %s; results in %s", "log-signatures" if on else "signatures", RESULTS)
+    return RESULTS
 
 
 def last_full_month_end(today: pd.Timestamp | None = None) -> str:
@@ -142,7 +156,10 @@ def vol_config(quick: bool = False, **changes) -> ex.ExperimentConfig:
     )
     if quick:  # a short history and fewer epochs, to check that everything runs
         cfg = replace(cfg, fx_start="2021-01-01", torch_epochs=25, output_dir=cfg.output_dir + "_quick")
-    return replace(cfg, **changes)
+    cfg = replace(cfg, **changes)
+    # the signature kind goes into every horizon's spec (and so into the feature-cache key)
+    over = {h: {**cfg.spec_overrides.get(h, {}), "sig_kind": SIG_KIND} for h in cfg.horizons}
+    return replace(cfg, spec_overrides={**cfg.spec_overrides, **over})
 
 
 def pair_vol_config(symbol: str, quick: bool = False, **changes) -> ex.ExperimentConfig:
@@ -194,7 +211,7 @@ def anomaly_config(quick: bool = False, symbol: str = SYMBOL, **changes) -> Anom
         target_rows={"1d": None, "5d": None},
         channel_sets=ANOMALY_CHANNELS, normalizations=("trailing_vol",), window_mults=(1.0,),
         lead_lag=(True,), depths=(2, 3), stage_b_detectors=("hmm",), stage_b_top_k=3,
-        data_dir=str(DATA_DIR), output_dir=str(out),
+        data_dir=str(DATA_DIR), output_dir=str(out), sig_kind=SIG_KIND,
     )
     if quick:
         cfg = replace(cfg, start="2021-01-01", n_bootstrap=100, output_dir=cfg.output_dir + "_quick")
@@ -607,6 +624,69 @@ def anomaly_vol_pairs_table(cfgs: dict) -> pd.DataFrame:
             LOGGER.warning("%s: not finished (%s)", sym, exc)
     t = pd.concat(frames, ignore_index=True)
     return t[["Pair"] + [c for c in t.columns if c != "Pair"]]
+
+
+# ---------------------------------------------------------------- signatures vs log-signatures
+
+
+def _summary_pct(run_dir: Path, har_dir: Path) -> pd.Series | None:
+    """Fold-mean RMSE % better than HAR-RV-L per (horizon, model) of one finished run; HAR comes
+    from ``har_dir`` (the same pair's run that fit it, on the same rows)."""
+    try:
+        m = rp.load_results(run_dir).metrics
+        h = rp.load_results(har_dir).metrics if har_dir != run_dir else m
+    except (FileNotFoundError, ValueError):
+        return None
+    har = h[h.Model == "HAR-RV-L"].groupby("Horizon").RMSE.mean()
+    g = m.groupby(["Horizon", "Model"]).RMSE.mean()
+    return 100 * (1 - g / g.index.get_level_values(0).map(har).to_numpy())
+
+
+def sig_vs_logsig_table(models=("Ridge | intraday signature", "Ridge | intraday lag bank (matched)",
+                                "Ridge | intraday signature + HAR-RV")) -> pd.DataFrame:
+    """Every vol run that exists in both results/ (signatures) and results_logsig/ (log-signatures):
+    % RMSE better than HAR-RV-L for the signature models under each. Includes the main EUR/USD run,
+    the other pairs (section 9), the pairs-together runs (10) and one pair at a time (10b). The lag
+    bank is matched in size to each, so it shrinks with the log-signature too."""
+    runs = [("main", SYMBOL, Path("vol"), Path("vol"))]
+    runs += [("pair", s, Path("pairs") / s / "vol", Path("pairs") / s / "vol") for s in PAIRS if s != SYMBOL]
+    for s in PAIRS:
+        for v in CROSS_VARIANTS + tuple(with_variant(p) for p in PAIRS if p != s):
+            runs.append((cross_label(v), s, Path("cross") / s / v, Path("cross") / s / "own"))
+    rows = []
+    for name, sym, rel, har_rel in runs:
+        a = _summary_pct(HERE / "results" / rel, HERE / "results" / har_rel)
+        b = _summary_pct(HERE / "results_logsig" / rel, HERE / "results_logsig" / har_rel)
+        if a is None or b is None:
+            continue
+        for (h, model) in a.index:
+            if model in models and (h, model) in b.index:
+                rows.append({"Run": name, "Pair": sym, "Horizon": h, "Model": model,
+                             "Signature": a[(h, model)], "Log-signature": b[(h, model)]})
+    t = pd.DataFrame(rows)
+    if t.empty:
+        LOGGER.warning("No run finished under both results/ and results_logsig/ yet")
+        return t
+    t["Log-sig minus sig"] = t["Log-signature"] - t["Signature"]
+    return t
+
+
+def anomaly_sig_vs_logsig() -> pd.DataFrame:
+    """The anomaly gate per pair under signatures and log-signatures (both studies must exist)."""
+    from anomaly import report as R
+
+    frames = []
+    for sym in PAIRS:
+        rel = Path("anomaly") if sym == SYMBOL else Path("pairs") / sym / "anomaly"
+        for kind, root in (("signature", "results"), ("log-signature", "results_logsig")):
+            try:
+                frames.append(R.gate_table(R.load_results(HERE / root / rel)).assign(Pair=sym, Kind=kind))
+            except FileNotFoundError:
+                pass
+    if not frames:
+        return pd.DataFrame()
+    t = pd.concat(frames, ignore_index=True)
+    return t.set_index(["Pair", "Horizon", "Kind"]).reset_index()
 
 
 # ---------------------------------------------------------------- volatility direction
